@@ -5,6 +5,8 @@ import base64
 import tempfile
 import subprocess
 import threading
+import difflib
+import datetime
 from urllib.parse import quote
 
 import cv2
@@ -36,17 +38,62 @@ SLEEP_PHRASES = [
     "never mind",
     "nevermind",
     "that's all",
+    "that's it",
+    "thats it",
+    "that's all for now",
+    "thats all for now",
+    "that's everything",
+    "thats everything",
+    "we're done",
+    "were done",
+    "i'm done",
+    "im done",
+    "all done",
     "go to sleep",
+    "go back to sleep",
+    "go idle",
+    "go silent",
+    "be quiet",
+    "quiet now",
+    "stop talking",
+    "stop responding",
+    "stop answering",
     "stop listening",
+    "stop listening now",
+    "stop for now",
+    "pause listening",
+    "pause for now",
+    "mute yourself",
+    "mute",
     "thanks jarvis",
     "thank you jarvis",
+    "thanks that's all",
+    "thanks thats all",
+    "thank you that's all",
+    "thank you thats all",
     "bye jarvis",
     "goodbye jarvis",
+    "good night jarvis",
+    "goodnight jarvis",
     "abort",
     "abort mission",
     "cancel",
+    "cancel that",
+    "cancel this",
+    "cancel it",
     "cancel task",
     "abort task",
+    "dismiss",
+    "dismiss that",
+    "stand down",
+    "power down",
+    "shut down",
+    "shut it down",
+    "shut up",
+    "leave me alone",
+    "stop now",
+    "sleep",
+    "idle",
 ]
 
 SLEEP_AFTER_SECONDS = 18
@@ -88,6 +135,18 @@ SAVE_DEBUG_WEBCAM_FRAME = True
 DEBUG_WEBCAM_FRAME_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "jarvis_last_webcam.jpg",
+)
+
+# Persistent notes/todos stored beside this file
+TODO_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "todo.md")
+NOTES_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.md")
+
+# Desktop vision
+AUTO_SEND_DESKTOP_IMAGES = True
+SAVE_DEBUG_DESKTOP_FRAME = True
+DEBUG_DESKTOP_FRAME_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "jarvis_last_desktop.jpg",
 )
 
 # Set this to True if you want Jarvis to speak every boot step.
@@ -168,7 +227,7 @@ VISION_CAN_BE_VERBALLY_DISABLED = True
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are Jarvis, a fast local voice assistant with optional webcam vision.
+You are Jarvis, a fast local voice assistant with optional webcam vision and optional desktop screenshot vision.
 
 Style:
 - Calm, polished, precise, and capable.
@@ -192,9 +251,10 @@ Critical output rules:
 
 Vision rules:
 - You may receive webcam images.
+- You may receive desktop screenshots.
 - Use them only when relevant.
 - If the user asks what they are holding, doing, showing, pointing at, looking at, or what changed in the room/background, use vision.
-- If the user asks what changed, compare the labeled Previous webcam frame against the labeled Current webcam frame.
+- If the user asks what changed, compare the labeled Previous webcam frame against the labeled Current webcam frame (or the labeled Previous desktop screenshot against the labeled Current desktop screenshot if desktop screenshots are provided).
 - If the user says "try now", "again", "one more time", "how about now", or similar after a vision request, use the newest image.
 - If the image is too dark, blurry, blocked, or unclear, say so plainly.
 - Never pretend to see something clearly if the frame is unclear.
@@ -205,6 +265,12 @@ Tool rules:
 
 - If the user specifically asks for Wikipedia, end your response with:
 [[TOOL:wikipedia|your query]]
+
+- If the user asks for basic local facts like the current time/date/day, end your response with:
+[[TOOL:local_info|time]]
+[[TOOL:local_info|date]]
+[[TOOL:local_info|day_of_week]]
+[[TOOL:local_info|day_of_month]]
 
 - Only use tools when needed.
 - If using a tool, first say a short natural line like:
@@ -271,7 +337,18 @@ last_capture_previous_frame_cv = None
 last_capture_current_frame_cv = None
 last_vision_time = 0.0
 vision_enabled = True
+
+previous_desktop_b64 = None
+previous_desktop_cv = None
+last_capture_previous_desktop_cv = None
+last_capture_current_desktop_cv = None
+last_desktop_time = 0.0
+desktop_enabled = True
 last_tool_search_query = ""
+app_index = None
+app_index_built_at = 0.0
+last_todo_snapshot = ""
+last_notes_snapshot = ""
 
 working_sfx_thread = None
 working_sfx_stop_event = None
@@ -650,6 +727,42 @@ def text_requests_vision_on(text: str) -> bool:
     return any(phrase in t for phrase in on_phrases)
 
 
+def text_requests_desktop_off(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    off_phrases = [
+        "stop looking at my screen",
+        "stop looking at my desktop",
+        "don't look at my screen",
+        "do not look at my screen",
+        "don't look at my desktop",
+        "do not look at my desktop",
+        "turn off desktop",
+        "desktop off",
+        "screen off",
+        "no desktop",
+        "no screen",
+    ]
+
+    return any(phrase in t for phrase in off_phrases)
+
+
+def text_requests_desktop_on(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    on_phrases = [
+        "look at my screen",
+        "look at my desktop",
+        "show you my screen",
+        "show you my desktop",
+        "screen on",
+        "desktop on",
+        "use desktop",
+    ]
+
+    return any(phrase in t for phrase in on_phrases)
+
+
 def user_directly_needs_vision(text: str) -> bool:
     t = (text or "").lower().strip()
 
@@ -714,6 +827,60 @@ def user_directly_needs_vision(text: str) -> bool:
 
     return any(phrase in t for phrase in vision_phrases)
 
+
+def user_directly_needs_desktop(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    negative_context_phrases = [
+        "stop looking at my screen",
+        "stop looking at my desktop",
+        "don't look at my screen",
+        "do not look at my screen",
+        "don't look at my desktop",
+        "do not look at my desktop",
+    ]
+
+    if any(phrase in t for phrase in negative_context_phrases):
+        return False
+
+    desktop_phrases = [
+        "on my screen",
+        "on my desktop",
+        "my screen",
+        "my desktop",
+        "screen shot",
+        "screenshot",
+        "take a screenshot",
+        "what's on my screen",
+        "what is on my screen",
+        "what's on my desktop",
+        "what is on my desktop",
+        "what changed on my screen",
+        "what changed on my desktop",
+        "compare my screen",
+        "compare my desktop",
+    ]
+
+    return any(phrase in t for phrase in desktop_phrases)
+
+
+def user_requests_desktop_comparison(text: str) -> bool:
+    t = (text or "").lower().strip()
+
+    comparison_phrases = [
+        "what changed on my screen",
+        "what changed on my desktop",
+        "compare my screen",
+        "compare my desktop",
+        "what is different on my screen",
+        "what is different on my desktop",
+        "what's different on my screen",
+        "what's different on my desktop",
+        "any differences on my screen",
+        "any differences on my desktop",
+    ]
+
+    return any(phrase in t for phrase in comparison_phrases)
 
 def user_is_vision_followup(text: str) -> bool:
     t = (text or "").lower().strip()
@@ -865,6 +1032,221 @@ def capture_webcam_b64():
     return old_b64, current_b64
 
 
+def _escape_ps_single_quoted(path: str) -> str:
+    return (path or "").replace("'", "''")
+
+
+def _capture_desktop_to_file(path: str) -> bool:
+    if not path:
+        return False
+
+    safe_path = _escape_ps_single_quoted(path)
+
+    script = f"""
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing | Out-Null
+$screen = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $bitmap.Size)
+$bitmap.Save('{safe_path}', [System.Drawing.Imaging.ImageFormat]::Jpeg)
+$graphics.Dispose()
+$bitmap.Dispose()
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=18,
+        )
+
+        if result.returncode != 0:
+            print("[DESKTOP] PowerShell screenshot failed:", (result.stderr or "").strip())
+            return False
+
+        return os.path.exists(path) and os.path.getsize(path) > 0
+
+    except Exception as e:
+        print("[DESKTOP] Screenshot error:", e)
+        return False
+
+
+def capture_desktop_b64():
+    global previous_desktop_b64
+    global previous_desktop_cv
+    global last_capture_previous_desktop_cv
+    global last_capture_current_desktop_cv
+
+    tmp_path = tempfile.mktemp(suffix=".jpg")
+
+    try:
+        ok = _capture_desktop_to_file(tmp_path)
+        if not ok:
+            return previous_desktop_b64, None
+
+        data = None
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+
+        if not data:
+            return previous_desktop_b64, None
+
+        img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            print("[DESKTOP] Failed to decode screenshot bytes.")
+            return previous_desktop_b64, None
+
+        brightness = float(img.mean())
+        print(f"[DESKTOP] Screenshot brightness: {brightness:.2f}")
+
+        if SAVE_DEBUG_DESKTOP_FRAME:
+            try:
+                cv2.imwrite(DEBUG_DESKTOP_FRAME_PATH, img)
+                print(f"[DESKTOP] Saved debug screenshot: {DEBUG_DESKTOP_FRAME_PATH}")
+            except Exception as e:
+                print("[DESKTOP] Failed to save debug screenshot:", e)
+
+        img = cv2.resize(img, (VISION_IMAGE_WIDTH, VISION_IMAGE_HEIGHT))
+
+        success, buffer = cv2.imencode(
+            ".jpg",
+            img,
+            [int(cv2.IMWRITE_JPEG_QUALITY), VISION_JPEG_QUALITY],
+        )
+
+        if not success:
+            print("[DESKTOP] Failed to encode screenshot.")
+            return previous_desktop_b64, None
+
+        current_b64 = base64.b64encode(buffer).decode("utf-8")
+        old_b64 = previous_desktop_b64
+
+        last_capture_previous_desktop_cv = None
+        if previous_desktop_cv is not None:
+            last_capture_previous_desktop_cv = previous_desktop_cv.copy()
+
+        last_capture_current_desktop_cv = img.copy()
+        previous_desktop_b64 = current_b64
+        previous_desktop_cv = img.copy()
+
+        return old_b64, current_b64
+
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def get_desktop_difference_hint() -> str:
+    global last_capture_previous_desktop_cv
+    global last_capture_current_desktop_cv
+
+    prev = last_capture_previous_desktop_cv
+    curr = last_capture_current_desktop_cv
+
+    if prev is None or curr is None:
+        return "DIFF_STATUS=no_previous_frame"
+
+    if prev.shape != curr.shape:
+        curr = cv2.resize(curr, (prev.shape[1], prev.shape[0]))
+
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
+
+    prev_gray = cv2.GaussianBlur(prev_gray, (7, 7), 0)
+    curr_gray = cv2.GaussianBlur(curr_gray, (7, 7), 0)
+
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    mean_diff = float(np.mean(diff))
+
+    _, thresh = cv2.threshold(diff, 24, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((5, 5), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    thresh = cv2.dilate(thresh, kernel, iterations=2)
+
+    changed_pixels = int(cv2.countNonZero(thresh))
+    total_pixels = int(thresh.shape[0] * thresh.shape[1])
+    changed_ratio = changed_pixels / max(1, total_pixels)
+
+    print(
+        f"[DESKTOP DIFF] Mean diff: {mean_diff:.2f}. "
+        f"Changed area: {changed_ratio * 100:.2f}%."
+    )
+
+    if changed_ratio < DIFF_MIN_CHANGED_AREA_RATIO and mean_diff < 3.5:
+        return (
+            "DIFF_STATUS=no_significant_change; "
+            f"mean_pixel_delta={mean_diff:.2f}; "
+            f"changed_area_percent={changed_ratio * 100:.2f}"
+        )
+
+    if changed_ratio > DIFF_GLOBAL_LIGHTING_AREA_RATIO:
+        return (
+            "DIFF_STATUS=whole_frame_change; "
+            f"mean_pixel_delta={mean_diff:.2f}; "
+            f"changed_area_percent={changed_ratio * 100:.2f}"
+        )
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+
+        if area < 80:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        boxes.append((area, x, y, w, h))
+
+    if not boxes:
+        return (
+            "DIFF_STATUS=weak_local_change; "
+            f"mean_pixel_delta={mean_diff:.2f}; "
+            f"changed_area_percent={changed_ratio * 100:.2f}"
+        )
+
+    boxes.sort(reverse=True, key=lambda item: item[0])
+    top = boxes[:3]
+
+    min_x = min(x for _, x, y, w, h in top)
+    min_y = min(y for _, x, y, w, h in top)
+    max_x = max(x + w for _, x, y, w, h in top)
+    max_y = max(y + h for _, x, y, w, h in top)
+
+    frame_width = max(1, thresh.shape[1])
+    frame_height = max(1, thresh.shape[0])
+
+    center_x = ((min_x + max_x) / 2) / frame_width
+    center_y = ((min_y + max_y) / 2) / frame_height
+    width_ratio = (max_x - min_x) / frame_width
+    height_ratio = (max_y - min_y) / frame_height
+
+    return (
+        "DIFF_STATUS=localized_change; "
+        f"mean_pixel_delta={mean_diff:.2f}; "
+        f"changed_area_percent={changed_ratio * 100:.2f}; "
+        f"bbox_norm_x={min_x / frame_width:.3f}; "
+        f"bbox_norm_y={min_y / frame_height:.3f}; "
+        f"bbox_norm_w={width_ratio:.3f}; "
+        f"bbox_norm_h={height_ratio:.3f}; "
+        f"center_norm_x={center_x:.3f}; "
+        f"center_norm_y={center_y:.3f}"
+    )
+
+
 def get_visual_difference_hint() -> str:
     """
     Compares the previous and current webcam frames and returns neutral
@@ -1002,8 +1384,8 @@ def _vertical_region(value: float | None) -> str:
     return " around mid-height"
 
 
-def visual_comparison_fallback_reply() -> str:
-    hint = get_visual_difference_hint()
+def visual_comparison_fallback_reply(hint: str | None = None) -> str:
+    hint = hint if hint is not None else get_visual_difference_hint()
     hint_lower = hint.lower()
 
     if "no_previous_frame" in hint_lower:
@@ -1041,7 +1423,7 @@ def visual_comparison_fallback_reply() -> str:
 # ============================================================
 
 def remove_hidden_tool_commands(reply: str) -> str:
-    pattern = r"\[\[TOOL:(web_search|wikipedia)\|(.*?)\]\]"
+    pattern = r"\[\[TOOL:(web_search|wikipedia|local_info)\|(.*?)\]\]"
     return re.sub(pattern, "", reply or "", flags=re.IGNORECASE | re.DOTALL).strip()
 
 
@@ -1158,6 +1540,34 @@ def remove_wake_words(transcript: str) -> str:
     return cleaned.strip(" ,.!?-")
 
 
+def extract_post_wake_text(transcript: str) -> str:
+    """
+    Returns only the portion of the transcript after the first detected wake word.
+
+    This prevents Jarvis from reacting to unrelated speech that happened before
+    the wake word during idle listening.
+    """
+    raw = transcript or ""
+    lower = raw.lower()
+
+    best_index = None
+    best_len = 0
+
+    for word in WAKE_WORDS:
+        idx = lower.find(word)
+        if idx == -1:
+            continue
+        if best_index is None or idx < best_index:
+            best_index = idx
+            best_len = len(word)
+
+    if best_index is None:
+        return remove_wake_words(raw)
+
+    post = raw[best_index + best_len :]
+    return post.strip(" ,.!?-")
+
+
 def should_sleep(transcript: str) -> bool:
     t = transcript.lower()
     return any(phrase in t for phrase in SLEEP_PHRASES)
@@ -1256,6 +1666,25 @@ def call_lmstudio(messages, max_tokens=90, temperature=0.2) -> str:
     return cleaned_reply
 
 
+def looks_like_truncated_reply(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 24:
+        return False
+
+    if t.endswith(("-", "—", "…", "...", ",", ";", ":", "(", "[")):
+        return True
+
+    last_word = re.sub(r"[^a-zA-Z]+", "", t.split()[-1].lower())
+    if last_word in {"and", "but", "so", "because", "to", "with", "without", "or"}:
+        return True
+
+    # If it is long-ish and doesn't end with normal sentence punctuation, it may be cut.
+    if len(t) >= 50 and not re.search(r"[.!?][\"')\\]]?$", t):
+        return True
+
+    return False
+
+
 def should_send_previous_frame(user_text: str) -> bool:
     if SEND_PREVIOUS_WEBCAM_FRAME_FOR_COMPARISON:
         return True
@@ -1266,12 +1695,16 @@ def should_send_previous_frame(user_text: str) -> bool:
 def build_user_content(
     user_text: str,
     include_vision: bool,
+    include_desktop: bool = False,
     force_single_current_frame: bool = False,
 ):
-    if not include_vision:
+    if not include_vision and not include_desktop:
         return user_text
 
-    prev_img, curr_img = capture_webcam_b64()
+    if include_desktop:
+        prev_img, curr_img = capture_desktop_b64()
+    else:
+        prev_img, curr_img = capture_webcam_b64()
 
     content = [
         {
@@ -1280,16 +1713,26 @@ def build_user_content(
         }
     ]
 
+    wants_comparison = (
+        user_requests_desktop_comparison(user_text)
+        if include_desktop
+        else user_requests_visual_comparison(user_text)
+    )
+
     comparison_mode = (
         prev_img
         and curr_img
         and not force_single_current_frame
-        and should_send_previous_frame(user_text)
+        and (wants_comparison or should_send_previous_frame(user_text))
     )
 
     if comparison_mode:
-        diff_hint = get_visual_difference_hint()
-        print("[VISION DIFF]", diff_hint)
+        if include_desktop:
+            diff_hint = get_desktop_difference_hint()
+            print("[DESKTOP DIFF]", diff_hint)
+        else:
+            diff_hint = get_visual_difference_hint()
+            print("[VISION DIFF]", diff_hint)
 
         content.append(
             {
@@ -1304,8 +1747,11 @@ def build_user_content(
         )
 
         if ALLOW_TWO_IMAGE_VISION_COMPARISON:
+            label_prev = "Previous desktop screenshot:" if include_desktop else "Previous webcam frame:"
+            label_curr = "Current desktop screenshot:" if include_desktop else "Current webcam frame:"
+
             print("[VISION] Sending previous + current frames for comparison.")
-            content.append({"type": "text", "text": "Previous webcam frame:"})
+            content.append({"type": "text", "text": label_prev})
             content.append(
                 {
                     "type": "image_url",
@@ -1314,10 +1760,11 @@ def build_user_content(
                     },
                 }
             )
-            content.append({"type": "text", "text": "Current webcam frame:"})
+            content.append({"type": "text", "text": label_curr})
         else:
+            label_curr = "Current desktop screenshot:" if include_desktop else "Current webcam frame:"
             print("[VISION] Sending current frame + OpenCV diff hint for comparison.")
-            content.append({"type": "text", "text": "Current webcam frame:"})
+            content.append({"type": "text", "text": label_curr})
 
         content.append(
             {
@@ -1329,10 +1776,11 @@ def build_user_content(
         )
 
     elif curr_img:
+        label_curr = "Current desktop screenshot:" if include_desktop else "Current webcam frame:"
         content.append(
             {
                 "type": "text",
-                "text": "Current webcam frame:",
+                "text": label_curr,
             }
         )
         content.append(
@@ -1385,6 +1833,42 @@ def should_include_vision(user_text: str) -> bool:
     return include_vision
 
 
+def should_include_desktop(user_text: str) -> bool:
+    global last_desktop_time
+    global desktop_enabled
+
+    if not AUTO_SEND_DESKTOP_IMAGES:
+        return False
+
+    if text_requests_desktop_off(user_text):
+        desktop_enabled = False
+        last_desktop_time = 0.0
+        print("[DESKTOP] Desktop vision disabled by user speech.")
+        return False
+
+    direct_desktop_request = user_directly_needs_desktop(user_text)
+
+    if direct_desktop_request or text_requests_desktop_on(user_text):
+        desktop_enabled = True
+
+    if not desktop_enabled:
+        return False
+
+    recent_context = (
+        VISION_FOLLOWUP_ENABLED
+        and last_desktop_time > 0
+        and time.time() - last_desktop_time <= VISION_FOLLOWUP_SECONDS
+    )
+
+    explicit_followup = user_is_vision_followup(user_text)
+    include_desktop = direct_desktop_request or (explicit_followup and recent_context)
+
+    if include_desktop:
+        last_desktop_time = time.time()
+
+    return include_desktop
+
+
 def get_vision_rescue_response(user_text: str) -> str:
     print("[VISION] Retrying with a fresh single-frame vision prompt.")
 
@@ -1421,16 +1905,28 @@ If the image is unclear, say it is unclear.
 
 
 def get_jarvis_response(user_text: str) -> str:
+    include_desktop = should_include_desktop(user_text)
     include_vision = should_include_vision(user_text)
-    comparison_mode = include_vision and user_requests_visual_comparison(user_text)
 
-    if include_vision:
+    # Prefer desktop screenshots when explicitly requested, unless the user is
+    # clearly asking for the webcam/camera.
+    if include_desktop and not user_directly_needs_vision(user_text):
+        include_vision = False
+
+    comparison_mode = (
+        (include_desktop and (user_requests_desktop_comparison(user_text) or user_requests_visual_comparison(user_text)))
+        or (include_vision and user_requests_visual_comparison(user_text))
+    )
+
+    if include_desktop:
+        print("[DESKTOP] Attaching desktop screenshot to this request.")
+    elif include_vision:
         print("[VISION] Attaching webcam frame to this request.")
 
     if comparison_mode:
         print("[VISION] Visual comparison mode enabled.")
 
-    user_content = build_user_content(user_text, include_vision)
+    user_content = build_user_content(user_text, include_vision, include_desktop=include_desktop)
 
     system_prompt = SYSTEM_PROMPT
 
@@ -1439,7 +1935,7 @@ def get_jarvis_response(user_text: str) -> str:
 
 Visual comparison override:
 - The current request is about what changed.
-- Compare the labeled Previous webcam frame and Current webcam frame.
+- Compare the labeled Previous and Current images provided (webcam frames or desktop screenshots).
 - Ignore old chat history for visual details.
 - Name the most likely visible change in one short sentence.
 - Do not claim a specific object changed unless it is visually clear.
@@ -1460,17 +1956,49 @@ Visual comparison override:
 
     reply = call_lmstudio(
         messages,
-        max_tokens=VISION_COMPARISON_MAX_TOKENS if comparison_mode else (140 if include_vision else 110),
+        max_tokens=VISION_COMPARISON_MAX_TOKENS if comparison_mode else (200 if (include_vision or include_desktop) else 180),
         temperature=0.12 if comparison_mode else 0.2,
     )
 
     if reply:
+        if looks_like_truncated_reply(reply):
+            print("[LM] Reply looked truncated. Requesting a short continuation.")
+            continuation = call_lmstudio(
+                messages
+                + [
+                    {"role": "assistant", "content": reply},
+                    {
+                        "role": "user",
+                        "content": "Continue and finish your previous reply. Output only the continuation, no preamble.",
+                    },
+                ],
+                max_tokens=80,
+                temperature=0.15,
+            )
+
+            continuation = (continuation or "").strip()
+            if continuation:
+                combined = (reply.rstrip() + " " + continuation.lstrip()).strip()
+                combined = clean_model_text(combined)
+                if combined:
+                    return combined
+
         return reply
 
     print("LM Studio returned blank. Retrying simple prompt...")
 
     # Vision models are especially prone to blanking when context gets chunky.
-    # Use a fresh single webcam frame before giving up.
+    # Use a fresh single frame before giving up.
+    if include_desktop:
+        reply = get_desktop_rescue_response(user_text)
+
+        if reply:
+            return reply
+
+        if comparison_mode:
+            print("[DESKTOP DIFF] LM Studio blanked; using deterministic visual diff fallback.")
+            return visual_comparison_fallback_reply(get_desktop_difference_hint())
+
     if include_vision:
         reply = get_vision_rescue_response(user_text)
 
@@ -1502,14 +2030,75 @@ If images are included, answer using the image. If two labeled images are includ
 
     reply = call_lmstudio(
         simple_messages,
-        max_tokens=90,
+        max_tokens=140,
+        temperature=0.15,
+    )
+
+    if reply:
+        if looks_like_truncated_reply(reply):
+            continuation = call_lmstudio(
+                simple_messages
+                + [
+                    {"role": "assistant", "content": reply},
+                    {
+                        "role": "user",
+                        "content": "Continue and finish your previous reply. Output only the continuation, no preamble.",
+                    },
+                ],
+                max_tokens=70,
+                temperature=0.15,
+            )
+            continuation = (continuation or "").strip()
+            if continuation:
+                combined = clean_model_text((reply.rstrip() + " " + continuation.lstrip()).strip())
+                if combined:
+                    return combined
+        return reply
+
+    return fallback_reply(user_text)
+
+
+def get_desktop_rescue_response(user_text: str) -> str:
+    print("[DESKTOP] Retrying with a fresh single desktop screenshot prompt.")
+
+    user_content = build_user_content(
+        user_text,
+        include_vision=False,
+        include_desktop=True,
+        force_single_current_frame=not (
+            user_requests_desktop_comparison(user_text) or user_requests_visual_comparison(user_text)
+        ),
+    )
+
+    rescue_messages = [
+        {
+            "role": "system",
+            "content": """
+You are Jarvis, a concise desktop screenshot assistant.
+Look at the provided desktop screenshot or labeled screenshot pair and answer the user's question.
+If Previous and Current screenshots are provided, compare them. Do not guess unless it is visually clear.
+Say only the final spoken answer.
+Do not use <think>.
+Do not describe your reasoning.
+If the image is unclear, say it is unclear.
+""",
+        },
+        {
+            "role": "user",
+            "content": user_content,
+        },
+    ]
+
+    reply = call_lmstudio(
+        rescue_messages,
+        max_tokens=100,
         temperature=0.15,
     )
 
     if reply:
         return reply
 
-    return fallback_reply(user_text)
+    return ""
 
 
 def fallback_reply(user_text: str) -> str:
@@ -1534,7 +2123,7 @@ def fallback_reply(user_text: str) -> str:
 # ============================================================
 
 def extract_tool_command(reply: str):
-    pattern = r"\[\[TOOL:(web_search|wikipedia)\|(.*?)\]\]"
+    pattern = r"\[\[TOOL:(web_search|wikipedia|local_info)\|(.*?)\]\]"
     match = re.search(pattern, reply or "", flags=re.IGNORECASE | re.DOTALL)
 
     if not match:
@@ -1941,6 +2530,69 @@ def web_search(query: str) -> str:
         return f"Web search failed: {e}"
 
 
+def local_info(query: str) -> str:
+    q = re.sub(r"[^a-z0-9_ ]+", " ", (query or "").lower()).strip()
+    q = re.sub(r"\s+", " ", q)
+
+    now = datetime.datetime.now().astimezone()
+
+    if q in {"", "time"}:
+        return now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+
+    if q in {"date", "today"}:
+        return now.strftime("%B %-d, %Y") if "%" in "%-d" else now.strftime("%B %d, %Y").replace(" 0", " ")
+
+    if q in {"day_of_week", "weekday", "day"}:
+        return now.strftime("%A")
+
+    if q in {"day_of_month", "day_of_the_month"}:
+        # Avoid leading zeros.
+        return str(int(now.strftime("%d")))
+
+    if q in {"datetime", "now"}:
+        # Example: Friday, May 29, 2026 at 3:42 PM
+        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        return f"{now.strftime('%A')}, {now.strftime('%B')} {int(now.strftime('%d'))}, {now.strftime('%Y')} at {time_str}"
+
+    return f"Unsupported local_info query: {query!r}"
+
+
+def local_info_response_for_text(text: str) -> str | None:
+    t = (text or "").lower().strip()
+
+    time_phrases = [
+        "what time is it",
+        "tell me the time",
+        "time is it",
+        "current time",
+        "the time",
+    ]
+
+    date_phrases = [
+        "what's the date",
+        "what is the date",
+        "today's date",
+        "todays date",
+        "what day is it",
+        "what day of the week is it",
+        "day of the week",
+        "weekday",
+        "day of month",
+        "day of the month",
+    ]
+
+    if t == "time" or any(p in t for p in time_phrases):
+        now = datetime.datetime.now().astimezone()
+        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        return f"It is {time_str}."
+
+    if any(p in t for p in date_phrases) or t in {"date", "day", "weekday"}:
+        now = datetime.datetime.now().astimezone()
+        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        return f"Today is {now.strftime('%A')}, {now.strftime('%B')} {int(now.strftime('%d'))}, {now.strftime('%Y')}. It is {time_str}."
+
+    return None
+
 def run_tool(tool_name: str, query: str) -> str:
     global last_tool_search_query
 
@@ -1961,6 +2613,9 @@ def run_tool(tool_name: str, query: str) -> str:
     if tool_name == "web_search":
         return web_search(query)
 
+    if tool_name == "local_info":
+        return local_info(query)
+
     return "No tool was used."
 
 
@@ -1974,6 +2629,383 @@ def trim_tool_data(tool_data: str) -> str:
         tool_data[:MAX_TOOL_DATA_CHARS]
         + "\n\n[Tool data was truncated because it was too long.]"
     )
+
+
+# ============================================================
+# APP LAUNCHING (SHORTCUT SEARCH)
+# ============================================================
+
+def _run_powershell_json(script: str, timeout_seconds: int = 30):
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+
+        if result.returncode != 0:
+            print("[APPS] PowerShell failed:", (result.stderr or "").strip())
+            return None
+
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+
+        import json
+        return json.loads(out)
+
+    except Exception as e:
+        print("[APPS] PowerShell/JSON error:", e)
+        return None
+
+
+def build_app_index(force_refresh: bool = False):
+    global app_index
+    global app_index_built_at
+
+    # Rebuild occasionally in case shortcuts change.
+    if (not force_refresh) and app_index and (time.time() - app_index_built_at) < 300:
+        return app_index
+
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+$paths = @(
+  "$env:USERPROFILE\Desktop",
+  "$env:PUBLIC\Desktop",
+  "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+)
+$paths = $paths | Where-Object { $_ -and (Test-Path $_) }
+$wsh = New-Object -ComObject WScript.Shell
+
+$lnks = @()
+foreach ($p in $paths) {
+  $lnks += Get-ChildItem -Path $p -Recurse -Filter *.lnk
+}
+
+$urls = @()
+foreach ($p in $paths) {
+  $urls += Get-ChildItem -Path $p -Recurse -Filter *.url
+}
+
+$items = @()
+foreach ($f in $lnks) {
+  $s = $wsh.CreateShortcut($f.FullName)
+  $items += [pscustomobject]@{
+    kind = 'lnk'
+    name = $f.BaseName
+    shortcut_path = $f.FullName
+    target_path = $s.TargetPath
+    arguments = $s.Arguments
+    working_directory = $s.WorkingDirectory
+  }
+}
+
+foreach ($f in $urls) {
+  $raw = Get-Content -LiteralPath $f.FullName -Raw
+  $m = [regex]::Match($raw, '(?im)^URL=(.+)$')
+  $url = if ($m.Success) { $m.Groups[1].Value.Trim() } else { '' }
+  $items += [pscustomobject]@{
+    kind = 'url'
+    name = $f.BaseName
+    shortcut_path = $f.FullName
+    target_path = $url
+    arguments = ''
+    working_directory = ''
+  }
+}
+
+$items | ConvertTo-Json -Compress
+"""
+
+    data = _run_powershell_json(script, timeout_seconds=35)
+
+    # ConvertTo-Json returns an object for a single item, array for many.
+    if isinstance(data, dict):
+        data = [data]
+
+    app_index = data if isinstance(data, list) else []
+    app_index_built_at = time.time()
+
+    print(f"[APPS] Indexed {len(app_index)} shortcuts.")
+    return app_index
+
+
+# ============================================================
+# TODO / NOTES (MARKDOWN) WITH DIFF
+# ============================================================
+
+def _ensure_text_file(path: str, default_text: str):
+    try:
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(default_text)
+    except Exception as e:
+        print("[FILES] Failed to ensure file:", path, e)
+
+
+def _read_text(path: str) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        print("[FILES] Read error:", path, e)
+        return ""
+
+
+def _write_text(path: str, text: str) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text or "")
+        return True
+    except Exception as e:
+        print("[FILES] Write error:", path, e)
+        return False
+
+
+def _append_line(path: str, line: str) -> bool:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            if line and not line.endswith("\n"):
+                line += "\n"
+            f.write(line or "")
+        return True
+    except Exception as e:
+        print("[FILES] Append error:", path, e)
+        return False
+
+
+def _short_diff(old: str, new: str, max_lines: int = 18) -> str:
+    old_lines = (old or "").splitlines()
+    new_lines = (new or "").splitlines()
+
+    diff_lines = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile="before",
+            tofile="after",
+            lineterm="",
+            n=1,
+        )
+    )
+
+    # Drop headers to keep TTS clean.
+    diff_lines = [line for line in diff_lines if not line.startswith(("---", "+++", "@@"))]
+
+    if not diff_lines:
+        return "No changes."
+
+    clipped = diff_lines[:max_lines]
+    if len(diff_lines) > max_lines:
+        clipped.append("... (diff truncated)")
+
+    # Make it a single speakable sentence-ish chunk.
+    cleaned = []
+    for line in clipped:
+        if line.startswith("+"):
+            cleaned.append("Added: " + line[1:].strip())
+        elif line.startswith("-"):
+            cleaned.append("Removed: " + line[1:].strip())
+        else:
+            cleaned.append(line.strip())
+
+    return " ".join([c for c in cleaned if c])
+
+
+def _extract_after_prefix(text: str, prefix: str) -> str:
+    m = re.match(rf"^{re.escape(prefix)}\s+(.+)$", (text or "").strip(), flags=re.IGNORECASE)
+    return (m.group(1).strip() if m else "")
+
+
+def handle_todo_notes_command(transcript: str) -> tuple[bool, str]:
+    """
+    Returns (handled, reply).
+
+    Supported phrases (examples):
+    - "add todo buy milk"
+    - "add note prefers short answers"
+    - "show todo"
+    - "show notes"
+    - "diff todo"
+    - "diff notes"
+    """
+    global last_todo_snapshot
+    global last_notes_snapshot
+
+    t = (transcript or "").strip()
+    tl = t.lower().strip()
+
+    if not t:
+        return False, ""
+
+    _ensure_text_file(TODO_MD_PATH, "# Todo\n\n")
+    _ensure_text_file(NOTES_MD_PATH, "# Notes\n\n")
+
+    if tl.startswith("add todo "):
+        item = _extract_after_prefix(t, "add todo")
+        if not item:
+            return True, "What should I add to your todo list, sir?"
+        ok = _append_line(TODO_MD_PATH, f"- [ ] {item}")
+        return True, ("Added to todo." if ok else "I could not write to todo.md.")
+
+    if tl.startswith("add note "):
+        item = _extract_after_prefix(t, "add note")
+        if not item:
+            return True, "What should I note down, sir?"
+        ok = _append_line(NOTES_MD_PATH, f"- {item}")
+        return True, ("Added to notes." if ok else "I could not write to notes.md.")
+
+    if tl in ["show todo", "read todo", "open todo"]:
+        content = _read_text(TODO_MD_PATH).strip()
+        last_todo_snapshot = content
+        if not content:
+            return True, "Your todo list is empty."
+        # Keep it brief for TTS.
+        lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+        preview = "; ".join(lines[:8])
+        if len(lines) > 8:
+            preview += "; and more."
+        return True, (preview if preview else "Your todo list is empty.")
+
+    if tl in ["show notes", "read notes", "open notes"]:
+        content = _read_text(NOTES_MD_PATH).strip()
+        last_notes_snapshot = content
+        if not content:
+            return True, "Notes are empty."
+        lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+        preview = "; ".join(lines[:8])
+        if len(lines) > 8:
+            preview += "; and more."
+        return True, (preview if preview else "Notes are empty.")
+
+    if tl in ["diff todo", "todo diff", "what changed in todo", "what changed in my todo"]:
+        current = _read_text(TODO_MD_PATH).strip()
+        diff_text = _short_diff(last_todo_snapshot, current)
+        last_todo_snapshot = current
+        return True, diff_text
+
+    if tl in ["diff notes", "notes diff", "what changed in notes", "what changed in my notes"]:
+        current = _read_text(NOTES_MD_PATH).strip()
+        diff_text = _short_diff(last_notes_snapshot, current)
+        last_notes_snapshot = current
+        return True, diff_text
+
+    return False, ""
+
+
+def _score_app_match(name: str, query: str) -> int:
+    n = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    q = re.sub(r"[^a-z0-9]+", " ", (query or "").lower()).strip()
+
+    if not n or not q:
+        return 0
+
+    if n == q:
+        return 100
+
+    score = 0
+    q_words = [w for w in q.split() if w]
+
+    # All words present?
+    if q_words and all(w in n for w in q_words):
+        score += 40
+
+    if n.startswith(q):
+        score += 25
+
+    if q in n:
+        score += 20
+
+    # Shorter names are often better matches when equal.
+    score += max(0, 10 - min(10, len(n) // 4))
+
+    return score
+
+
+def find_best_app_shortcut(query: str):
+    items = build_app_index(force_refresh=False) or []
+
+    best = None
+    best_score = 0
+
+    for item in items:
+        name = item.get("name", "")
+        score = _score_app_match(name, query)
+        if score > best_score:
+            best = item
+            best_score = score
+
+    if best_score < 25:
+        return None
+
+    return best
+
+
+def extract_open_app_query(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    m = re.match(r"^(?:open|launch|start)\s+(.+)$", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .,!?:;")
+
+    m = re.search(r"\bsearch\s+(?:for\s+)?(.+?)\s+and\s+(?:open|launch|start)\b", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .,!?:;")
+
+    return ""
+
+
+def open_app_from_query(query: str) -> tuple[bool, str]:
+    q = (query or "").strip()
+    if not q:
+        return False, "Which app should I open, sir?"
+
+    item = find_best_app_shortcut(q)
+    if not item:
+        return False, f"I could not find a desktop or Start Menu shortcut matching {q!r}."
+
+    shortcut_path = item.get("shortcut_path", "")
+    kind = (item.get("kind") or "").lower()
+
+    try:
+        if shortcut_path and os.path.exists(shortcut_path):
+            os.startfile(shortcut_path)
+            return True, f"Opening {item.get('name', q)}."
+
+        # Fallback: try to start the target directly.
+        target = (item.get("target_path") or "").strip()
+        args = (item.get("arguments") or "").strip()
+
+        if kind == "url" and target:
+            os.startfile(target)
+            return True, f"Opening {item.get('name', q)}."
+
+        if target:
+            cmd = [target]
+            if args:
+                cmd += re.findall(r'\"[^\"]+\"|\\S+', args)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True, f"Opening {item.get('name', q)}."
+
+        return False, f"I found a shortcut named {item.get('name', q)!r}, but it did not include a runnable target."
+
+    except Exception as e:
+        return False, f"I tried to open {item.get('name', q)}, but it failed: {e}"
 
 
 def _clean_tool_sentence(text: str, max_chars: int = 440) -> str:
@@ -2271,6 +3303,28 @@ def boot():
 # ============================================================
 
 def handle_user_message(transcript: str):
+    local_reply = local_info_response_for_text(transcript)
+    if local_reply:
+        speak(local_reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", local_reply)
+        return
+
+    handled, reply = handle_todo_notes_command(transcript)
+    if handled:
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
+        return
+
+    open_query = extract_open_app_query(transcript)
+    if open_query:
+        ok, reply = open_app_from_query(open_query)
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
+        return
+
     forced_tool, forced_query = force_tool_if_obvious(transcript)
 
     if forced_tool != "none":
@@ -2404,7 +3458,7 @@ def main():
                 active = True
                 last_active_time = time.time()
 
-                cleaned = remove_wake_words(transcript)
+                cleaned = extract_post_wake_text(transcript)
 
                 if not cleaned:
                     speak("At your service, Caleb.", use_working_sfx=False)
