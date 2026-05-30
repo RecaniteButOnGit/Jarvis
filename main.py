@@ -103,6 +103,11 @@ AUTO_SEND_WEBCAM_IMAGES = True
 # After a vision question, messages like "try now" still send webcam frames.
 VISION_FOLLOWUP_SECONDS = 25
 
+# Auto-disengage when active but user seems to be talking to someone else.
+AUTO_DISENGAGE_NOT_ADDRESSED = True
+NON_ADDRESSED_STRIKES = 3
+NON_ADDRESSED_RESET_SECONDS = 20
+
 # Debug image saved beside this file.
 SAVE_DEBUG_WEBCAM_FRAME = True
 DEBUG_WEBCAM_FRAME_PATH = os.path.join(
@@ -113,9 +118,9 @@ DEBUG_WEBCAM_FRAME_PATH = os.path.join(
 # Persistent notes/todos stored beside this file
 TODO_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "todo.md")
 NOTES_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.md")
-CODEX_BRIDGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex_bridge.jsonl")
-CODEX_BRIDGE_ENABLED = True
-CODEX_DEFAULT_ALLOWED_ROOT = os.path.dirname(os.path.abspath(__file__))
+HISTORY_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.jsonl")
+PERSIST_HISTORY = True
+HISTORY_TIMEZONE_NAME = "local"
 
 # Terminal tool
 TERMINAL_ENABLED = True
@@ -164,7 +169,8 @@ SPEAK_BOOT_STEPS = False
 
 NO_THINK_SUFFIX = (
     "\n\nAnswer directly. Output only the final answer. "
-    "Do not include reasoning, analysis, hidden thoughts, scratch work, or thinking tags.\n\n"
+    "Do not include reasoning, analysis, hidden thoughts, scratch work, or thinking tags. "
+    "Be extremely brief unless the user explicitly asks for detail.\n\n"
 )
 
 # Tool data can get chunky. Keep it inside a sane prompt size.
@@ -174,6 +180,12 @@ MAX_TOOL_DATA_CHARS = 9000
 # to the model every turn (keeps responses fast).
 MAX_PROMPT_MESSAGES = 20
 MAX_PROMPT_CHARS = 24000
+
+# Speed/latency tuning
+FAST_MODE = True
+FAST_MAX_TOKENS = 80
+FAST_MAX_TOKENS_VISION = 140
+FAST_TEMPERATURE = 0.15
 
 # Prefer model-written summaries (less hardcoded phrasing). If the model blanks,
 # Jarvis falls back to a deterministic formatter.
@@ -283,13 +295,6 @@ Tool rules:
 
 - If the user specifically asks for Wikipedia, end your response with:
 [[TOOL:wikipedia|your query]]
-
-- If the user asks you to run a command locally inside the Jarvis folder, end your response with:
-[[TOOL:command|your command]]
-Notes:
-- Commands run with the working directory set to this Jarvis folder.
-- Potentially destructive commands are blocked unless the command is prefixed with:
-ALLOW_DESTRUCTIVE:
 
 - If the user asks for basic local facts like the current time/date/day, end your response with:
 [[TOOL:local_info|time]]
@@ -1689,6 +1694,7 @@ def add_history(role: str, content: str):
         {
             "role": role,
             "content": content,
+            "ts": time.time(),
         }
     )
 
@@ -1704,7 +1710,7 @@ def add_history(role: str, content: str):
     # Trim by approximate token budget (oldest first).
     total_tokens = 0
     for msg in reversed(history):
-        total_tokens += _estimate_tokens(msg.get("content", "")) + 8
+        total_tokens += _estimate_tokens(msg.get("content", "")) + 10
         if total_tokens > MAX_HISTORY_TOKENS:
             break
 
@@ -1714,101 +1720,25 @@ def add_history(role: str, content: str):
     trimmed = []
     running = 0
     for msg in reversed(history):
-        running += _estimate_tokens(msg.get("content", "")) + 8
+        running += _estimate_tokens(msg.get("content", "")) + 10
         if running > MAX_HISTORY_TOKENS:
             break
         trimmed.append(msg)
 
     history[:] = list(reversed(trimmed))
 
-
-def codex_bridge_log(role: str, text: str):
-    """
-    Best-effort bridge to the Codex desktop app: write a JSONL event log that
-    an external watcher (or you) can read inside this workspace.
-
-    Note: Jarvis cannot directly inject messages into the Codex chat UI.
-    """
-    if not CODEX_BRIDGE_ENABLED:
-        return
-
-    try:
-        payload = {
-            "ts": time.time(),
-            "role": (role or "").strip(),
-            "text": (text or "").strip(),
-        }
-        with open(CODEX_BRIDGE_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    if PERSIST_HISTORY:
+        try:
+            with open(HISTORY_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(history[-1], ensure_ascii=False)
+                    + "\n"
+                )
+        except Exception:
+            pass
 
 
-def extract_codex_instruction(text: str) -> str:
-    """
-    Voice commands to send an instruction to Codex:
-    - "codex: refactor main.py to ..."
-    - "send to codex refactor main.py to ..."
-    - "tell codex refactor main.py to ..."
-    """
-    t = (text or "").strip()
-    if not t:
-        return ""
 
-    # Speech-to-text often mishears "codex" as "codecs".
-    m = re.match(r"^(?:codex|codecs)\s*:\s*(.+)$", t, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    # Also allow natural phrases anywhere in the sentence, like:
-    # "can you tell codex to ..."
-    # "hi jarvis, ask codex ..."
-    m = re.search(
-        r"\b(?:send\s+to|send\s+this\s+to|tell|ask)\s+(?:codex|codecs)\b\s*(?:to\s+)?(.+)$",
-        t,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        return (m.group(1) or "").strip()
-
-    return ""
-
-
-def rewrite_codex_instruction(user_request: str) -> str:
-    """
-    Uses the current model to turn a casual voice request into a concise,
-    actionable instruction for Codex. Avoids hardcoded templates; if the model
-    is unavailable, returns the original request.
-    """
-    req = (user_request or "").strip()
-    if not req:
-        return ""
-
-    allowed_root = CODEX_DEFAULT_ALLOWED_ROOT
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Paraphrase the user's request into a single concise instruction for a coding agent named Codex.\n"
-                "Hard rules:\n"
-                "- Keep the same meaning.\n"
-                "- Do NOT add acceptance criteria, steps, safety constraints, file names, or extra details.\n"
-                "- Output ONLY the paraphrased instruction, one sentence.\n"
-                "- Preserve who should be able to use it (e.g., Jarvis) and the core capability requested.\n"
-                "- Preserve the target location/scope if mentioned (e.g., Documents/GitHub folder).\n"
-                f"- Keep any directory references as-is; current workspace root is: {allowed_root}\n"
-            ),
-        },
-        {
-            "role": "user",
-            "content": req,
-        },
-    ]
-
-    rewritten = call_model(messages, max_tokens=60, temperature=0.2)
-    rewritten = (rewritten or "").strip()
-    return rewritten if rewritten else req
 
 
 def _path_within_root(path: str, root: str) -> bool:
@@ -1996,8 +1926,8 @@ def seems_addressing_jarvis(transcript: str) -> bool:
     if len(t.split()) <= 3:
         return True
 
-    # Default: if they didn't use any addressing pattern, treat as not addressed.
-    return False
+    # Default conservative: if uncertain, assume it's for Jarvis.
+    return True
 
 
 def exit_conversation(reason: str = ""):
@@ -2027,7 +1957,10 @@ def patch_no_think(messages):
             content = copied.get("content")
 
             if isinstance(content, str):
-                copied["content"] = content + NO_THINK_SUFFIX
+                if NO_THINK_SUFFIX.strip() not in content:
+                    copied["content"] = content + NO_THINK_SUFFIX
+                else:
+                    copied["content"] = content
 
             elif isinstance(content, list):
                 new_content = []
@@ -2035,7 +1968,11 @@ def patch_no_think(messages):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         new_item = dict(item)
-                        new_item["text"] = new_item.get("text", "") + NO_THINK_SUFFIX
+                        text = new_item.get("text", "")
+                        if NO_THINK_SUFFIX.strip() not in (text or ""):
+                            new_item["text"] = (text or "") + NO_THINK_SUFFIX
+                        else:
+                            new_item["text"] = text
                         new_content.append(new_item)
                     else:
                         new_content.append(item)
@@ -2132,6 +2069,54 @@ def _load_dotenv_once():
 def _get_gemini_api_key() -> str:
     _load_dotenv_once()
     return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def _format_history_ts(ts: float | int | None) -> str:
+    try:
+        if ts is None:
+            return ""
+        dt = datetime.datetime.fromtimestamp(float(ts)).astimezone()
+        return dt.strftime("%Y-%m-%d %I:%M:%S %p").lstrip("0")
+    except Exception:
+        return ""
+
+
+def load_persisted_history():
+    global history
+
+    if not PERSIST_HISTORY:
+        return
+
+    if not os.path.exists(HISTORY_LOG_PATH):
+        return
+
+    loaded = []
+
+    try:
+        with open(HISTORY_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            for line in f.read().splitlines()[-8000:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                role = (obj.get("role") or "").strip()
+                content = clean_model_text(obj.get("content", ""))
+                ts = obj.get("ts")
+
+                if role not in {"user", "assistant", "system"} or not content:
+                    continue
+
+                loaded.append({"role": role, "content": content, "ts": ts})
+
+    except Exception as e:
+        _log(f"[HISTORY] Failed to load persisted history: {e}")
+        return
+
+    history = loaded[-MAX_HISTORY_MESSAGES:]
 
 
 def _apply_audio_fx_int16(pcm: np.ndarray) -> np.ndarray:
@@ -2349,6 +2334,8 @@ def call_gemini(messages, max_tokens=90, temperature=0.2) -> str:
                 "If you used `setx`, restart the terminal/Codex app. Or add GEMINI_API_KEY to `.env` beside main.py.",
             )
         return ""
+
+    messages = patch_no_think(messages)
 
     system_text = ""
     contents = []
@@ -2752,16 +2739,24 @@ Visual comparison override:
 - If you cannot identify a specific change, say you cannot tell clearly.
 """
 
+    def _with_ts_prefix(msg: dict) -> dict:
+        ts = _format_history_ts(msg.get("ts"))
+        if not ts:
+            return {"role": msg.get("role"), "content": msg.get("content")}
+        return {"role": msg.get("role"), "content": f"[{ts}] {msg.get('content','')}"}
+
+    hist_slice = (
+        (history[-MAX_PROMPT_MESSAGES:] if len(history) > MAX_PROMPT_MESSAGES else history)
+        if not comparison_mode
+        else []
+    )
+
     messages = [
         {
             "role": "system",
             "content": system_prompt,
         },
-        *(
-            (history[-MAX_PROMPT_MESSAGES:] if len(history) > MAX_PROMPT_MESSAGES else history)
-            if not comparison_mode
-            else []
-        ),
+        *[_with_ts_prefix(m) for m in hist_slice],
         {
             "role": "user",
             "content": user_content,
@@ -2780,11 +2775,14 @@ Visual comparison override:
         else:
             break
 
-    reply = call_model(
-        messages,
-        max_tokens=VISION_COMPARISON_MAX_TOKENS if comparison_mode else (200 if (include_vision or include_desktop) else 180),
-        temperature=0.12 if comparison_mode else 0.2,
-    )
+    if FAST_MODE:
+        max_tokens = VISION_COMPARISON_MAX_TOKENS if comparison_mode else (FAST_MAX_TOKENS_VISION if (include_vision or include_desktop) else FAST_MAX_TOKENS)
+        temperature = 0.12 if comparison_mode else FAST_TEMPERATURE
+    else:
+        max_tokens = VISION_COMPARISON_MAX_TOKENS if comparison_mode else (200 if (include_vision or include_desktop) else 180)
+        temperature = 0.12 if comparison_mode else 0.2
+
+    reply = call_model(messages, max_tokens=max_tokens, temperature=temperature)
 
     if reply:
         return reply
@@ -2834,8 +2832,8 @@ If images are included, answer using the image. If two labeled images are includ
 
     reply = call_model(
         simple_messages,
-        max_tokens=140,
-        temperature=0.15,
+        max_tokens=(min(FAST_MAX_TOKENS, 120) if FAST_MODE else 140),
+        temperature=(FAST_TEMPERATURE if FAST_MODE else 0.15),
     )
 
     if reply:
@@ -3399,96 +3397,6 @@ def local_info_response_for_text(text: str) -> str | None:
 
     return None
 
-def _is_potentially_destructive_command(command: str) -> bool:
-    c = (command or "").strip().lower()
-    if not c:
-        return False
-
-    # Simple heuristics. This is not a security boundary; it's just a guardrail.
-    destructive_patterns = [
-        r"\bremove-item\b",
-        r"\brm\b",
-        r"\bdel\b",
-        r"\berase\b",
-        r"\brmdir\b",
-        r"\brd\b",
-        r"\bformat\b",
-        r"\bshutdown\b",
-        r"\brestart-computer\b",
-        r"\bstop-computer\b",
-        r"\bnet\s+user\b",
-        r"\breg\s+add\b",
-        r"\breg\s+delete\b",
-        r"\bsc\s+delete\b",
-        r"\bsc\s+stop\b",
-    ]
-    for pat in destructive_patterns:
-        if re.search(pat, c):
-            return True
-    return False
-
-
-def command_tool(command: str) -> str:
-    """
-    Executes a PowerShell command with the working directory set to the Jarvis folder.
-    Returns stdout/stderr and the exit code as plain text.
-    """
-    cmd = (command or "").strip()
-    if not cmd:
-        return "No command provided."
-
-    allow_prefix = "ALLOW_DESTRUCTIVE:"
-    allow_destructive = False
-    if cmd.upper().startswith(allow_prefix):
-        allow_destructive = True
-        cmd = cmd[len(allow_prefix):].strip()
-
-    if _is_potentially_destructive_command(cmd) and not allow_destructive:
-        return (
-            "Command blocked as potentially destructive. "
-            "If you really want to run it, prefix the command with 'ALLOW_DESTRUCTIVE:'."
-        )
-
-    workdir = CODEX_DEFAULT_ALLOWED_ROOT
-
-    # Run inside a PowerShell session with a fixed initial working directory.
-    # NOTE: This is not a sandbox. The command can still reference absolute paths.
-    ps_script = (
-        "$ErrorActionPreference = 'Continue'\n"
-        f"Set-Location -LiteralPath '{workdir}'\n"
-        + cmd
-    )
-
-    try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                ps_script,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return "Command timed out after 30 seconds."
-    except Exception as e:
-        return f"Command tool error: {e}"
-
-    stdout = (result.stdout or "").rstrip()
-    stderr = (result.stderr or "").rstrip()
-
-    parts = [f"Exit code: {result.returncode}"]
-    if stdout:
-        parts.append("STDOUT:\n" + stdout)
-    if stderr:
-        parts.append("STDERR:\n" + stderr)
-    return "\n\n".join(parts).strip()
-
 def run_tool(tool_name: str, query: str) -> str:
     global last_tool_search_query
 
@@ -3511,9 +3419,6 @@ def run_tool(tool_name: str, query: str) -> str:
 
     if tool_name == "local_info":
         return local_info(query)
-
-    if tool_name == "command":
-        return command_tool(query)
 
     return "No tool was used."
 
@@ -4233,8 +4138,8 @@ Hard rules:
 
     reply = call_model(
         messages,
-        max_tokens=180,
-        temperature=0.15,
+        max_tokens=(min(FAST_MAX_TOKENS, 140) if FAST_MODE else 180),
+        temperature=(FAST_TEMPERATURE if FAST_MODE else 0.15),
     )
 
     reply = clean_model_text(reply)
@@ -4265,6 +4170,8 @@ def boot():
     start_working_sfx()
 
     try:
+        load_persisted_history()
+
         boot_log("Initializing Jarvis", "Primary runtime loading", "Booting up, sir.")
 
         boot_log("Loading audio system", "Whisper preparing", "Bringing my ears online.")
@@ -4538,16 +4445,16 @@ def main():
 
         # If already in an active session but the user appears to be talking to
         # someone else, ignore it and disengage after a couple occurrences.
-        if active and not seems_addressing_jarvis(transcript):
+        if AUTO_DISENGAGE_NOT_ADDRESSED and active and not seems_addressing_jarvis(transcript):
             now = time.time()
-            if last_non_addressed_time and (now - last_non_addressed_time) > 25:
+            if last_non_addressed_time and (now - last_non_addressed_time) > NON_ADDRESSED_RESET_SECONDS:
                 non_addressed_count = 0
 
             non_addressed_count += 1
             last_non_addressed_time = now
             print(f"[STATE] Utterance not addressed to Jarvis (count={non_addressed_count}).")
 
-            if non_addressed_count >= 2:
+            if non_addressed_count >= NON_ADDRESSED_STRIKES:
                 speak("Standing by.", use_working_sfx=False)
                 exit_conversation("auto-disengage: user not addressing Jarvis")
 
