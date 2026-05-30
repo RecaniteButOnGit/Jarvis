@@ -7,7 +7,9 @@ import subprocess
 import threading
 import difflib
 import datetime
+import json
 from urllib.parse import quote
+import shlex
 
 import cv2
 import numpy as np
@@ -20,7 +22,25 @@ import soundfile as sf
 # ============================================================
 
 LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-LM_MODEL = "google/gemma-4-e4b"
+LM_MODEL = "google/gemma-4-e2b"
+
+# Primary online model (Gemini). LM Studio remains as an offline fallback.
+USE_GEMINI_PRIMARY = True
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+LOG_VERBOSE = False
+
+# Gemini TTS (online) - currently disabled; Piper is primary.
+USE_GEMINI_TTS = False
+GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+GEMINI_TTS_VOICE = "Charon"
+GEMINI_TTS_LANGUAGE_CODE = "en-US"
+GEMINI_TTS_STYLE_TAGS = "[deadpan] [normal pace] [neutral] [low pitch]"
+
+# Optional audio effects (0.0 = off).
+FX_BITCRUSH = 0.0        # 0..1
+FX_DISTORTION = 0.0      # 0..1
+FX_PITCH_DOWN = 0.0      # semitones (0..12 recommended)
 
 WAKE_WORDS = [
     "jarvis",
@@ -36,68 +56,14 @@ WAKE_WORDS = [
 
 SLEEP_PHRASES = [
     "never mind",
-    "nevermind",
-    "that's all",
-    "that's it",
-    "thats it",
-    "that's all for now",
-    "thats all for now",
-    "that's everything",
-    "thats everything",
-    "we're done",
-    "were done",
-    "i'm done",
-    "im done",
-    "all done",
-    "go to sleep",
-    "go back to sleep",
-    "go idle",
-    "go silent",
-    "be quiet",
-    "quiet now",
-    "stop talking",
-    "stop responding",
-    "stop answering",
-    "stop listening",
-    "stop listening now",
-    "stop for now",
-    "pause listening",
-    "pause for now",
-    "mute yourself",
-    "mute",
-    "thanks jarvis",
-    "thank you jarvis",
-    "thanks that's all",
-    "thanks thats all",
-    "thank you that's all",
-    "thank you thats all",
-    "bye jarvis",
-    "goodbye jarvis",
-    "good night jarvis",
-    "goodnight jarvis",
-    "abort",
-    "abort mission",
     "cancel",
-    "cancel that",
-    "cancel this",
-    "cancel it",
-    "cancel task",
-    "abort task",
-    "dismiss",
-    "dismiss that",
-    "stand down",
-    "power down",
-    "shut down",
-    "shut it down",
-    "shut up",
-    "leave me alone",
-    "stop now",
-    "sleep",
-    "idle",
+    "abort",
 ]
 
 SLEEP_AFTER_SECONDS = 18
-MAX_HISTORY_MESSAGES = 12
+MAX_HISTORY_MESSAGES = 2000
+# Approximate rolling context window (rough token estimate, not exact tokenizer).
+MAX_HISTORY_TOKENS = 1_000_000
 
 WHISPER_MODEL = "small.en"
 WHISPER_DEVICE = "cuda"
@@ -106,8 +72,10 @@ WHISPER_COMPUTE = "float16"
 SAMPLE_RATE = 16000
 
 # These are MAX recording windows, not hard cutoffs.
-RECORD_SECONDS_IDLE = 7
-RECORD_SECONDS_ACTIVE = 22
+# Keep idle windows short so Jarvis stays responsive when no one is speaking.
+RECORD_SECONDS_IDLE = 99999999
+RECORD_SECONDS_ACTIVE = 999999
+PRE_ROLL_SECONDS = 1.0
 
 AUDIO_BLOCK_SECONDS = 0.1
 
@@ -123,6 +91,11 @@ MIN_RECORD_SECONDS = 0.8
 
 PIPER_EXE = r"C:\Users\me\AppData\Local\Python\pythoncore-3.14-64\Scripts\piper.exe"
 PIPER_MODEL = r"C:\Users\me\Documents\GitHub\Jarvis\voices\en_US-danny-low.onnx"
+PIPER_USE_CUDA = True
+PIPER_LENGTH_SCALE = 0.92
+PIPER_SENTENCE_SILENCE = 0.02
+PIPER_NO_NORMALIZE = True
+PIPER_STREAM_AUDIO = False
 
 WEBCAM_INDEX = 0
 AUTO_SEND_WEBCAM_IMAGES = True
@@ -140,6 +113,43 @@ DEBUG_WEBCAM_FRAME_PATH = os.path.join(
 # Persistent notes/todos stored beside this file
 TODO_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "todo.md")
 NOTES_MD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.md")
+CODEX_BRIDGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex_bridge.jsonl")
+CODEX_BRIDGE_ENABLED = True
+CODEX_DEFAULT_ALLOWED_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Terminal tool
+TERMINAL_ENABLED = True
+TERMINAL_ALLOWED_ROOT = os.path.dirname(os.path.abspath(__file__))
+TERMINAL_ALLOWED_EXES = {
+    "git",
+    "rg",
+    "dir",
+    "type",
+    "more",
+    "python",
+    "py",
+    "pip",
+    "pip3",
+    "node",
+    "npm",
+    "npx",
+    "where",
+    "whoami",
+}
+TERMINAL_BLOCKLIST_WORDS = {
+    "del",
+    "erase",
+    "rmdir",
+    "rd",
+    "format",
+    "diskpart",
+    "shutdown",
+    "reboot",
+    "restart",
+    "reg",
+    "bcdedit",
+}
+MAX_TERMINAL_OUTPUT_CHARS = 2000
 
 # Desktop vision
 AUTO_SEND_DESKTOP_IMAGES = True
@@ -152,14 +162,22 @@ DEBUG_DESKTOP_FRAME_PATH = os.path.join(
 # Set this to True if you want Jarvis to speak every boot step.
 SPEAK_BOOT_STEPS = False
 
-NO_THINK_SUFFIX = "\n\nAnswer directly. Do not include reasoning, analysis, hidden thoughts, or thinking tags."
+NO_THINK_SUFFIX = (
+    "\n\nAnswer directly. Output only the final answer. "
+    "Do not include reasoning, analysis, hidden thoughts, scratch work, or thinking tags.\n\n"
+)
 
 # Tool data can get chunky. Keep it inside a sane prompt size.
 MAX_TOOL_DATA_CHARS = 9000
 
-# Local models sometimes blank on final tool summarization. When false,
-# Jarvis uses a deterministic generic formatter for tool results instead.
-USE_LM_FOR_TOOL_FINAL_PASS = False
+# Even if we retain a very large rolling history, do not send huge context
+# to the model every turn (keeps responses fast).
+MAX_PROMPT_MESSAGES = 20
+MAX_PROMPT_CHARS = 24000
+
+# Prefer model-written summaries (less hardcoded phrasing). If the model blanks,
+# Jarvis falls back to a deterministic formatter.
+USE_LM_FOR_TOOL_FINAL_PASS = True
 
 # ============================================================
 # SOUND EFFECT CONFIG
@@ -266,6 +284,13 @@ Tool rules:
 - If the user specifically asks for Wikipedia, end your response with:
 [[TOOL:wikipedia|your query]]
 
+- If the user asks you to run a command locally inside the Jarvis folder, end your response with:
+[[TOOL:command|your command]]
+Notes:
+- Commands run with the working directory set to this Jarvis folder.
+- Potentially destructive commands are blocked unless the command is prefixed with:
+ALLOW_DESTRUCTIVE:
+
 - If the user asks for basic local facts like the current time/date/day, end your response with:
 [[TOOL:local_info|time]]
 [[TOOL:local_info|date]]
@@ -298,6 +323,7 @@ Style:
 - Concise.
 - Polished.
 - Natural spoken response.
+- Summarize the key point first, then offer to elaborate.
 - If the data is weak, incomplete, or failed, say that plainly.
 - Do not invent facts not supported by the tool data.
 """
@@ -331,6 +357,9 @@ history = []
 active = False
 last_active_time = 0.0
 
+non_addressed_count = 0
+last_non_addressed_time = 0.0
+
 previous_frame_b64 = None
 previous_frame_cv = None
 last_capture_previous_frame_cv = None
@@ -349,10 +378,17 @@ app_index = None
 app_index_built_at = 0.0
 last_todo_snapshot = ""
 last_notes_snapshot = ""
+gemini_warned_missing_key = False
+gemini_last_error_at = 0.0
+gemini_last_error_summary = ""
+dotenv_loaded = False
 
 working_sfx_thread = None
 working_sfx_stop_event = None
 working_sfx_lock = threading.Lock()
+piper_cuda_checked = False
+piper_cuda_ok = False
+piper_sample_rate = None
 
 # ============================================================
 # SOUND EFFECTS
@@ -490,6 +526,91 @@ def stop_working_sfx(stop_current_sound: bool = True):
 # SPEECH / TTS
 # ============================================================
 
+def _check_piper_cuda_support() -> bool:
+    global piper_cuda_checked
+    global piper_cuda_ok
+
+    if piper_cuda_checked:
+        return piper_cuda_ok
+
+    piper_cuda_checked = True
+
+    if not PIPER_USE_CUDA:
+        piper_cuda_ok = False
+        return False
+
+    try:
+        test_wav = tempfile.mktemp(suffix=".wav")
+
+        cmd = [
+            PIPER_EXE,
+            "--cuda",
+            "--model",
+            PIPER_MODEL,
+            "--output_file",
+            test_wav,
+            "--sentence-silence",
+            "0",
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        _stdout, stderr = process.communicate("test")
+        ok = process.returncode == 0 and os.path.exists(test_wav) and os.path.getsize(test_wav) > 0
+
+        if ok:
+            print("[TTS] Piper CUDA enabled.")
+            piper_cuda_ok = True
+        else:
+            err = (stderr or "").strip()
+            if err:
+                print("[TTS] Piper CUDA unavailable, falling back to CPU:", err[:250])
+            piper_cuda_ok = False
+
+    except Exception as e:
+        print("[TTS] Piper CUDA check failed, falling back to CPU:", e)
+        piper_cuda_ok = False
+
+    try:
+        if "test_wav" in locals() and os.path.exists(test_wav):
+            os.remove(test_wav)
+    except Exception:
+        pass
+
+    return piper_cuda_ok
+
+
+def _get_piper_sample_rate() -> int:
+    global piper_sample_rate
+
+    if isinstance(piper_sample_rate, int) and piper_sample_rate > 0:
+        return piper_sample_rate
+
+    # Piper voice configs are typically "<model>.json"
+    config_path = PIPER_MODEL + ".json"
+
+    try:
+        import json
+
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            rate = int(((cfg.get("audio") or {}).get("sample_rate") or 16000))
+            piper_sample_rate = rate if rate > 0 else 16000
+            return piper_sample_rate
+    except Exception as e:
+        print("[TTS] Failed to read Piper config sample_rate:", e)
+
+    piper_sample_rate = 16000
+    return piper_sample_rate
+
+
 def speak(text: str, use_working_sfx: bool = True, resume_working_after: bool = False):
     text = (text or "").strip()
 
@@ -504,15 +625,21 @@ def speak(text: str, use_working_sfx: bool = True, resume_working_after: bool = 
 
     print("Jarvis:", text)
 
-    wav_path = tempfile.mktemp(suffix=".wav")
-
     piper_cmd = [
         PIPER_EXE,
-        "--model",
-        PIPER_MODEL,
-        "--output_file",
-        wav_path,
     ]
+
+    if PIPER_LENGTH_SCALE is not None:
+        piper_cmd += ["--length-scale", str(PIPER_LENGTH_SCALE)]
+
+    if PIPER_SENTENCE_SILENCE is not None:
+        piper_cmd += ["--sentence-silence", str(PIPER_SENTENCE_SILENCE)]
+
+    if PIPER_NO_NORMALIZE:
+        piper_cmd += ["--no-normalize"]
+
+    if _check_piper_cuda_support():
+        piper_cmd += ["--cuda"]
 
     should_restart_after_voice = False
 
@@ -523,8 +650,16 @@ def speak(text: str, use_working_sfx: bool = True, resume_working_after: bool = 
 
             should_restart_after_voice = resume_working_after
 
+        wav_path = tempfile.mktemp(suffix=".wav")
+        file_cmd = list(piper_cmd) + [
+            "--model",
+            PIPER_MODEL,
+            "--output_file",
+            wav_path,
+        ]
+
         process = subprocess.Popen(
-            piper_cmd,
+            file_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -550,7 +685,7 @@ def speak(text: str, use_working_sfx: bool = True, resume_working_after: bool = 
         print("TTS error:", e)
 
     try:
-        if os.path.exists(wav_path):
+        if "wav_path" in locals() and os.path.exists(wav_path):
             os.remove(wav_path)
     except Exception:
         pass
@@ -560,17 +695,23 @@ def boot_log(title: str, detail: str, spoken: str | None = None):
     print(f"[JARVIS] {title}. {detail}")
 
     if SPEAK_BOOT_STEPS and spoken:
-        speak(spoken, use_working_sfx=False)
+        threading.Thread(
+            target=speak,
+            args=(spoken,),
+            kwargs={"use_working_sfx": False},
+            daemon=True,
+        ).start()
 
 # ============================================================
 # AUDIO / WHISPER
 # ============================================================
 
 def record_audio(max_seconds: int):
-    print(f"Listening for up to {max_seconds} seconds...")
+    print(f"Listening (pre-roll {PRE_ROLL_SECONDS:.1f}s, max {max_seconds}s)...")
 
     block_size = int(SAMPLE_RATE * AUDIO_BLOCK_SECONDS)
     max_blocks = max(1, int(max_seconds / AUDIO_BLOCK_SECONDS))
+    pre_roll_blocks = max(1, int(PRE_ROLL_SECONDS / AUDIO_BLOCK_SECONDS))
 
     silence_blocks_needed = max(
         1,
@@ -582,11 +723,13 @@ def record_audio(max_seconds: int):
         int(MIN_RECORD_SECONDS / AUDIO_BLOCK_SECONDS),
     )
 
+    pre_roll = []
     recorded_blocks = []
     speech_started = False
     stopped_after_silence = False
     silent_blocks = 0
     peak_rms = 0.0
+    speech_blocks = 0
 
     try:
         with sd.InputStream(
@@ -601,10 +744,13 @@ def record_audio(max_seconds: int):
                 if overflowed:
                     print("[AUDIO] Input overflow warning.")
 
-                recorded_blocks.append(block.copy())
-
                 rms = float(np.sqrt(np.mean(np.square(block))))
                 peak_rms = max(peak_rms, rms)
+
+                if not speech_started:
+                    pre_roll.append(block.copy())
+                    if len(pre_roll) > pre_roll_blocks:
+                        pre_roll.pop(0)
 
                 if rms >= SPEECH_RMS_THRESHOLD:
                     speech_started = True
@@ -613,7 +759,14 @@ def record_audio(max_seconds: int):
                     if speech_started:
                         silent_blocks += 1
 
-                has_recorded_minimum = block_index >= min_blocks
+                if speech_started:
+                    if pre_roll:
+                        recorded_blocks.extend(pre_roll)
+                        pre_roll.clear()
+                    recorded_blocks.append(block.copy())
+                    speech_blocks += 1
+
+                has_recorded_minimum = speech_blocks >= min_blocks
 
                 if (
                     speech_started
@@ -1443,6 +1596,26 @@ def clean_model_text(text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
 
+    # Remove common explicit reasoning headers if a model emits them anyway.
+    # Keep anything after an "Answer:" style marker when present.
+    if re.search(r"^(reasoning|analysis|thoughts)\s*:", text.strip(), flags=re.IGNORECASE):
+        final_marker = re.search(
+            r"(?:final answer|final|answer)\s*:\s*(.+)$",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if final_marker:
+            text = final_marker.group(1)
+        else:
+            # Drop the first paragraph (usually the reasoning) and keep the last.
+            paragraphs = [
+                paragraph.strip()
+                for paragraph in re.split(r"\n\s*\n", text)
+                if paragraph.strip()
+            ]
+            if len(paragraphs) >= 2:
+                text = paragraphs[-1]
+
     # Some local models emit "<think>" without a closing tag. The old cleaner
     # deleted everything after that, which could turn a valid response into blank.
     if re.search(r"<think>", text, flags=re.IGNORECASE):
@@ -1519,8 +1692,200 @@ def add_history(role: str, content: str):
         }
     )
 
+    # Rolling limits: keep a large message cap, plus an approximate token window.
+    def _estimate_tokens(text: str) -> int:
+        # Rough heuristic: ~4 chars per token in English, plus a small floor.
+        t = (text or "")
+        return max(1, int(len(t) / 4))
+
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
+
+    # Trim by approximate token budget (oldest first).
+    total_tokens = 0
+    for msg in reversed(history):
+        total_tokens += _estimate_tokens(msg.get("content", "")) + 8
+        if total_tokens > MAX_HISTORY_TOKENS:
+            break
+
+    if total_tokens <= MAX_HISTORY_TOKENS:
+        return
+
+    trimmed = []
+    running = 0
+    for msg in reversed(history):
+        running += _estimate_tokens(msg.get("content", "")) + 8
+        if running > MAX_HISTORY_TOKENS:
+            break
+        trimmed.append(msg)
+
+    history[:] = list(reversed(trimmed))
+
+
+def codex_bridge_log(role: str, text: str):
+    """
+    Best-effort bridge to the Codex desktop app: write a JSONL event log that
+    an external watcher (or you) can read inside this workspace.
+
+    Note: Jarvis cannot directly inject messages into the Codex chat UI.
+    """
+    if not CODEX_BRIDGE_ENABLED:
+        return
+
+    try:
+        payload = {
+            "ts": time.time(),
+            "role": (role or "").strip(),
+            "text": (text or "").strip(),
+        }
+        with open(CODEX_BRIDGE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def extract_codex_instruction(text: str) -> str:
+    """
+    Voice commands to send an instruction to Codex:
+    - "codex: refactor main.py to ..."
+    - "send to codex refactor main.py to ..."
+    - "tell codex refactor main.py to ..."
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # Speech-to-text often mishears "codex" as "codecs".
+    m = re.match(r"^(?:codex|codecs)\s*:\s*(.+)$", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # Also allow natural phrases anywhere in the sentence, like:
+    # "can you tell codex to ..."
+    # "hi jarvis, ask codex ..."
+    m = re.search(
+        r"\b(?:send\s+to|send\s+this\s+to|tell|ask)\s+(?:codex|codecs)\b\s*(?:to\s+)?(.+)$",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return (m.group(1) or "").strip()
+
+    return ""
+
+
+def rewrite_codex_instruction(user_request: str) -> str:
+    """
+    Uses the current model to turn a casual voice request into a concise,
+    actionable instruction for Codex. Avoids hardcoded templates; if the model
+    is unavailable, returns the original request.
+    """
+    req = (user_request or "").strip()
+    if not req:
+        return ""
+
+    allowed_root = CODEX_DEFAULT_ALLOWED_ROOT
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Paraphrase the user's request into a single concise instruction for a coding agent named Codex.\n"
+                "Hard rules:\n"
+                "- Keep the same meaning.\n"
+                "- Do NOT add acceptance criteria, steps, safety constraints, file names, or extra details.\n"
+                "- Output ONLY the paraphrased instruction, one sentence.\n"
+                "- Preserve who should be able to use it (e.g., Jarvis) and the core capability requested.\n"
+                "- Preserve the target location/scope if mentioned (e.g., Documents/GitHub folder).\n"
+                f"- Keep any directory references as-is; current workspace root is: {allowed_root}\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": req,
+        },
+    ]
+
+    rewritten = call_model(messages, max_tokens=60, temperature=0.2)
+    rewritten = (rewritten or "").strip()
+    return rewritten if rewritten else req
+
+
+def _path_within_root(path: str, root: str) -> bool:
+    try:
+        path_abs = os.path.abspath(path)
+        root_abs = os.path.abspath(root)
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except Exception:
+        return False
+
+
+def extract_terminal_command(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    m = re.match(r"^(?:terminal|term)\s+(?:run\s+)?(.+)$", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    return ""
+
+
+def run_terminal_command(command_text: str) -> tuple[bool, str]:
+    if not TERMINAL_ENABLED:
+        return False, "Terminal tool is disabled."
+
+    cmd_text = (command_text or "").strip()
+    if not cmd_text:
+        return False, "No command provided."
+
+    if not _path_within_root(TERMINAL_ALLOWED_ROOT, os.path.dirname(os.path.abspath(__file__))):
+        return False, "Terminal root path is invalid."
+
+    try:
+        args = shlex.split(cmd_text, posix=False)
+    except Exception:
+        return False, "Could not parse that command."
+
+    if not args:
+        return False, "No command provided."
+
+    exe = os.path.basename(args[0]).lower().strip()
+
+    if exe in TERMINAL_BLOCKLIST_WORDS:
+        return False, "That command is blocked."
+
+    if exe not in TERMINAL_ALLOWED_EXES:
+        return False, f"That command is not allowed: {exe}"
+
+    if not _path_within_root(TERMINAL_ALLOWED_ROOT, TERMINAL_ALLOWED_ROOT):
+        return False, "Terminal root path is invalid."
+
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=TERMINAL_ALLOWED_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            shell=False,
+        )
+
+        out = (completed.stdout or "") + (completed.stderr or "")
+        out = out.strip()
+        if len(out) > MAX_TERMINAL_OUTPUT_CHARS:
+            out = out[:MAX_TERMINAL_OUTPUT_CHARS].rstrip() + "\n...[output truncated]"
+
+        if not out:
+            out = f"Exit code: {completed.returncode}"
+
+        return completed.returncode == 0, out
+
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out."
+    except Exception as e:
+        return False, f"Command failed: {e}"
 
 # ============================================================
 # WAKE / SLEEP
@@ -1573,6 +1938,68 @@ def should_sleep(transcript: str) -> bool:
     return any(phrase in t for phrase in SLEEP_PHRASES)
 
 
+def seems_addressing_jarvis(transcript: str) -> bool:
+    t = (transcript or "").lower().strip()
+
+    if not t:
+        return True
+
+    # If they explicitly say the wake word, treat as addressed.
+    if contains_wake_word(t):
+        return True
+
+    # Quick patterns that usually mean they are speaking to Jarvis.
+    addressing_patterns = [
+        r"^\s*(hey|ok|okay|alright)\b",
+        r"\bjarvis\b",
+        r"\byou\b",
+        r"\bcan you\b",
+        r"\bcould you\b",
+        r"\bwould you\b",
+        r"\bplease\b",
+        r"\bwhat\b",
+        r"\bwhen\b",
+        r"\bwhere\b",
+        r"\bwho\b",
+        r"\bwhy\b",
+        r"\bhow\b",
+        r"\bopen\b",
+        r"\blaunch\b",
+        r"\bstart\b",
+        r"\badd todo\b",
+        r"\badd note\b",
+        r"\bshow todo\b",
+        r"\bshow notes\b",
+        r"\bdiff todo\b",
+        r"\bdiff notes\b",
+    ]
+
+    if any(re.search(p, t) for p in addressing_patterns):
+        return True
+
+    # If it looks like they are talking to someone else, treat as not addressed.
+    other_person_cues = [
+        r"\bguys\b",
+        r"\bbro\b",
+        r"\bdude\b",
+        r"\bbabe\b",
+        r"\bhoney\b",
+        r"\bmom\b",
+        r"\bdad\b",
+        r"\bkids\b",
+    ]
+
+    if any(re.search(p, t) for p in other_person_cues):
+        return False
+
+    # If it's very short and imperative-ish, assume it's for Jarvis.
+    if len(t.split()) <= 3:
+        return True
+
+    # Default: if they didn't use any addressing pattern, treat as not addressed.
+    return False
+
+
 def exit_conversation(reason: str = ""):
     global active
 
@@ -1618,6 +2045,406 @@ def patch_no_think(messages):
         patched_messages.append(copied)
 
     return patched_messages
+
+
+def _extract_text_from_gemini_candidate(candidate) -> str:
+    try:
+        parts = (((candidate or {}).get("content") or {}).get("parts") or [])
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join([t for t in texts if t]).strip()
+    except Exception:
+        return ""
+
+
+def _gemini_role(role: str) -> str:
+    r = (role or "").lower().strip()
+    if r == "assistant":
+        return "model"
+    return "user"
+
+
+def _log(msg: str):
+    if LOG_VERBOSE:
+        print(msg)
+
+
+def _print_useful_error_once(summary: str, detail: str = ""):
+    global gemini_last_error_at
+    global gemini_last_error_summary
+
+    summary = (summary or "").strip()
+    detail = (detail or "").strip()
+
+    now = time.time()
+
+    # Avoid spamming the console with the same message on every turn.
+    if summary and summary == gemini_last_error_summary and (now - gemini_last_error_at) < 60:
+        return
+
+    gemini_last_error_at = now
+    gemini_last_error_summary = summary
+
+    print(f"[GEMINI] {summary}")
+    if detail:
+        print(f"[GEMINI] Detail: {detail}")
+
+
+def _load_dotenv_once():
+    """
+    Loads a local `.env` file (ignored by git) into process env vars if present.
+    """
+    global dotenv_loaded
+
+    if dotenv_loaded:
+        return
+
+    dotenv_loaded = True
+
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if not os.path.exists(env_path):
+            return
+
+        with open(env_path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f.read().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("'\"")
+
+                if not key or key in os.environ:
+                    continue
+
+                os.environ[key] = value
+
+        _log("[ENV] Loaded .env values.")
+
+    except Exception as e:
+        _log(f"[ENV] Failed to load .env: {e}")
+
+
+def _get_gemini_api_key() -> str:
+    _load_dotenv_once()
+    return os.environ.get("GEMINI_API_KEY", "").strip()
+
+
+def _apply_audio_fx_int16(pcm: np.ndarray) -> np.ndarray:
+    """
+    Applies optional bitcrush/distortion effects to int16 mono PCM.
+    """
+    if pcm is None or pcm.size == 0:
+        return pcm
+
+    x = pcm.astype(np.float32) / 32768.0
+
+    if FX_DISTORTION and FX_DISTORTION > 0:
+        drive = 1.0 + float(FX_DISTORTION) * 12.0
+        x = np.tanh(x * drive)
+
+    if FX_BITCRUSH and FX_BITCRUSH > 0:
+        amt = float(FX_BITCRUSH)
+        bits = int(round(16 - amt * 12))  # 16 -> 4
+        bits = max(4, min(16, bits))
+        levels = float(2 ** bits)
+        x = np.round((x + 1.0) * 0.5 * (levels - 1.0)) / (levels - 1.0)
+        x = x * 2.0 - 1.0
+
+        # Optional sample-rate reduction via sample hold.
+        hold = int(round(1 + amt * 12))  # 1..13
+        if hold > 1 and x.size >= hold:
+            x2 = x.copy()
+            for i in range(0, x2.size, hold):
+                x2[i : i + hold] = x2[i]
+            x = x2
+
+    y = np.clip(x, -1.0, 1.0)
+    return (y * 32767.0).astype(np.int16)
+
+
+def _gemini_tts_payload(text: str) -> dict:
+    t = (text or "").strip()
+    if GEMINI_TTS_STYLE_TAGS:
+        t = f"{GEMINI_TTS_STYLE_TAGS} {t}"
+
+    return {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": t}],
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "languageCode": GEMINI_TTS_LANGUAGE_CODE,
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": GEMINI_TTS_VOICE,
+                    }
+                },
+            },
+        },
+    }
+
+
+def _extract_inline_audio_b64(obj: dict) -> str:
+    try:
+        candidates = obj.get("candidates") or []
+        if not candidates:
+            return ""
+        parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
+        if not parts:
+            return ""
+        inline = (parts[0] or {}).get("inlineData") or {}
+        data = inline.get("data") or ""
+        return data.strip()
+    except Exception:
+        return ""
+
+
+def speak_with_gemini_tts(text: str) -> bool:
+    """
+    Streams Gemini TTS audio if possible, otherwise tries non-streaming once.
+    Returns True if it successfully played audio.
+
+    Gemini TTS output is typically raw PCM (s16le) at 24kHz mono.
+    """
+    api_key = _get_gemini_api_key()
+    if not api_key or not USE_GEMINI_TTS:
+        return False
+
+    payload = _gemini_tts_payload(text)
+
+    base_rate = 24000
+    out_rate = base_rate
+    if FX_PITCH_DOWN and FX_PITCH_DOWN > 0:
+        try:
+            out_rate = int(round(base_rate * (2.0 ** (-float(FX_PITCH_DOWN) / 12.0))))
+            out_rate = max(8000, min(48000, out_rate))
+        except Exception:
+            out_rate = base_rate
+
+    stream_url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(GEMINI_TTS_MODEL, safe='')}:streamGenerateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(GEMINI_TTS_MODEL, safe='')}:generateContent?key={api_key}"
+
+    # Try streaming first.
+    try:
+        with requests.post(stream_url, json=payload, stream=True, timeout=120) as resp:
+            if resp.status_code == 200:
+                with sd.OutputStream(samplerate=out_rate, channels=1, dtype="int16") as stream:
+                    for raw_line in resp.iter_lines(decode_unicode=True):
+                        if not raw_line:
+                            continue
+
+                        line = raw_line.strip()
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+
+                        if not line or line == "[DONE]":
+                            continue
+
+                        try:
+                            import json
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+
+                        b64 = _extract_inline_audio_b64(obj)
+                        if not b64:
+                            continue
+
+                        pcm_bytes = base64.b64decode(b64)
+                        pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+                        pcm = _apply_audio_fx_int16(pcm)
+                        if pcm.size:
+                            stream.write(pcm.reshape(-1, 1))
+
+                return True
+
+            # If it isn't a success, surface a useful one-liner and fall back.
+            try:
+                err = (resp.text or "").strip()[:600]
+            except Exception:
+                err = ""
+            _print_useful_error_once("Gemini TTS streaming failed; falling back to Piper.", err)
+
+    except Exception as e:
+        _log(f"[GEMINI TTS] Streaming exception: {e}")
+
+    # Non-streaming fallback.
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        if resp.status_code != 200:
+            _print_useful_error_once("Gemini TTS request failed; falling back to Piper.", (resp.text or "")[:600])
+            return False
+
+        obj = resp.json()
+        b64 = _extract_inline_audio_b64(obj)
+        if not b64:
+            return False
+
+        pcm_bytes = base64.b64decode(b64)
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+        pcm = _apply_audio_fx_int16(pcm)
+        if pcm.size:
+            sd.play(pcm.astype(np.int16), samplerate=out_rate)
+            sd.wait()
+            return True
+
+    except Exception as e:
+        _log(f"[GEMINI TTS] Non-streaming exception: {e}")
+
+    return False
+
+
+def _content_to_gemini_parts(content):
+    if isinstance(content, str):
+        return [{"text": content}]
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("type") == "text":
+                parts.append({"text": item.get("text", "")})
+                continue
+
+            if item.get("type") == "image_url":
+                url = ((item.get("image_url") or {}).get("url") or "").strip()
+                if url.startswith("data:image/jpeg;base64,"):
+                    b64 = url.split(",", 1)[1].strip()
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": "image/jpeg",
+                                "data": b64,
+                            }
+                        }
+                    )
+                continue
+
+        return parts
+
+    return [{"text": str(content)}]
+
+
+def call_gemini(messages, max_tokens=90, temperature=0.2) -> str:
+    global gemini_warned_missing_key
+
+    api_key = _get_gemini_api_key()
+
+    if not api_key:
+        if not gemini_warned_missing_key:
+            gemini_warned_missing_key = True
+            _print_useful_error_once(
+                "GEMINI_API_KEY is not set. Falling back to LM Studio.",
+                "If you used `setx`, restart the terminal/Codex app. Or add GEMINI_API_KEY to `.env` beside main.py.",
+            )
+        return ""
+
+    system_text = ""
+    contents = []
+
+    for message in messages or []:
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "system" and isinstance(content, str):
+            system_text += (content.strip() + "\n")
+            continue
+
+        parts = _content_to_gemini_parts(content)
+        if not parts:
+            continue
+
+        contents.append(
+            {
+                "role": _gemini_role(role),
+                "parts": parts,
+            }
+        )
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+
+    if system_text.strip():
+        payload["systemInstruction"] = {
+            "parts": [
+                {
+                    "text": system_text.strip(),
+                }
+            ]
+        }
+
+    url = GEMINI_API_URL.format(model=quote(GEMINI_MODEL, safe=""))
+
+    try:
+        response = requests.post(
+            f"{url}?key={api_key}",
+            json=payload,
+            timeout=120,
+        )
+
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_json = response.json()
+                # Common Google error shape: {"error":{"code":...,"message":"...","status":"..."}}
+                err_obj = (err_json or {}).get("error") or {}
+                msg = (err_obj.get("message") or "").strip()
+                status = (err_obj.get("status") or "").strip()
+                code = err_obj.get("code")
+                bits = [b for b in [f"HTTP {response.status_code}", status, (f"code={code}" if code else ""), msg] if b]
+                detail = " | ".join(bits)
+            except Exception:
+                detail = (response.text or "").strip()[:600]
+
+            hint = ""
+            if response.status_code in (401, 403):
+                hint = "Your API key may be missing/invalid, or the API is not enabled for this key."
+            elif response.status_code == 404:
+                hint = f"Model {GEMINI_MODEL!r} may be unavailable or misspelled."
+            elif response.status_code == 429:
+                hint = "Rate limited. Try again in a moment."
+
+            _print_useful_error_once("Request failed; falling back to LM Studio.", " ".join([d for d in [detail, hint] if d]))
+            return ""
+
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+
+        raw_reply = _extract_text_from_gemini_candidate(candidates[0])
+        return clean_model_text(raw_reply)
+
+    except Exception as e:
+        _print_useful_error_once("Request exception; falling back to LM Studio.", str(e))
+        return ""
+
+
+def call_model(messages, max_tokens=90, temperature=0.2) -> str:
+    if USE_GEMINI_PRIMARY:
+        reply = call_gemini(messages, max_tokens=max_tokens, temperature=temperature)
+        if reply:
+            return reply
+        _log("[MODEL] Gemini unavailable; falling back to LM Studio.")
+
+    # LM Studio tends to be slower with very high output limits.
+    return call_lmstudio(messages, max_tokens=min(int(max_tokens), 220), temperature=temperature)
 
 
 def call_lmstudio(messages, max_tokens=90, temperature=0.2) -> str:
@@ -1666,23 +2493,6 @@ def call_lmstudio(messages, max_tokens=90, temperature=0.2) -> str:
     return cleaned_reply
 
 
-def looks_like_truncated_reply(text: str) -> bool:
-    t = (text or "").strip()
-    if len(t) < 24:
-        return False
-
-    if t.endswith(("-", "—", "…", "...", ",", ";", ":", "(", "[")):
-        return True
-
-    last_word = re.sub(r"[^a-zA-Z]+", "", t.split()[-1].lower())
-    if last_word in {"and", "but", "so", "because", "to", "with", "without", "or"}:
-        return True
-
-    # If it is long-ish and doesn't end with normal sentence punctuation, it may be cut.
-    if len(t) >= 50 and not re.search(r"[.!?][\"')\\]]?$", t):
-        return True
-
-    return False
 
 
 def should_send_previous_frame(user_text: str) -> bool:
@@ -1897,7 +2707,7 @@ If the image is unclear, say it is unclear.
         },
     ]
 
-    return call_lmstudio(
+    return call_model(
         rescue_messages,
         max_tokens=100,
         temperature=0.1,
@@ -1947,42 +2757,36 @@ Visual comparison override:
             "role": "system",
             "content": system_prompt,
         },
-        *(history if not comparison_mode else []),
+        *(
+            (history[-MAX_PROMPT_MESSAGES:] if len(history) > MAX_PROMPT_MESSAGES else history)
+            if not comparison_mode
+            else []
+        ),
         {
             "role": "user",
             "content": user_content,
         },
     ]
 
-    reply = call_lmstudio(
+    # Enforce a simple char budget so we don't send megabytes of context.
+    # Trim older history first.
+    while True:
+        approx = sum(len(str(m.get("content", ""))) for m in messages)
+        if approx <= MAX_PROMPT_CHARS or len(messages) <= 2:
+            break
+        # Drop the oldest history message (index 1, after system).
+        if len(messages) > 3 and messages[1].get("role") != "system":
+            messages.pop(1)
+        else:
+            break
+
+    reply = call_model(
         messages,
         max_tokens=VISION_COMPARISON_MAX_TOKENS if comparison_mode else (200 if (include_vision or include_desktop) else 180),
         temperature=0.12 if comparison_mode else 0.2,
     )
 
     if reply:
-        if looks_like_truncated_reply(reply):
-            print("[LM] Reply looked truncated. Requesting a short continuation.")
-            continuation = call_lmstudio(
-                messages
-                + [
-                    {"role": "assistant", "content": reply},
-                    {
-                        "role": "user",
-                        "content": "Continue and finish your previous reply. Output only the continuation, no preamble.",
-                    },
-                ],
-                max_tokens=80,
-                temperature=0.15,
-            )
-
-            continuation = (continuation or "").strip()
-            if continuation:
-                combined = (reply.rstrip() + " " + continuation.lstrip()).strip()
-                combined = clean_model_text(combined)
-                if combined:
-                    return combined
-
         return reply
 
     print("LM Studio returned blank. Retrying simple prompt...")
@@ -2028,31 +2832,13 @@ If images are included, answer using the image. If two labeled images are includ
         },
     ]
 
-    reply = call_lmstudio(
+    reply = call_model(
         simple_messages,
         max_tokens=140,
         temperature=0.15,
     )
 
     if reply:
-        if looks_like_truncated_reply(reply):
-            continuation = call_lmstudio(
-                simple_messages
-                + [
-                    {"role": "assistant", "content": reply},
-                    {
-                        "role": "user",
-                        "content": "Continue and finish your previous reply. Output only the continuation, no preamble.",
-                    },
-                ],
-                max_tokens=70,
-                temperature=0.15,
-            )
-            continuation = (continuation or "").strip()
-            if continuation:
-                combined = clean_model_text((reply.rstrip() + " " + continuation.lstrip()).strip())
-                if combined:
-                    return combined
         return reply
 
     return fallback_reply(user_text)
@@ -2089,7 +2875,7 @@ If the image is unclear, say it is unclear.
         },
     ]
 
-    reply = call_lmstudio(
+    reply = call_model(
         rescue_messages,
         max_tokens=100,
         temperature=0.15,
@@ -2102,21 +2888,7 @@ If the image is unclear, say it is unclear.
 
 
 def fallback_reply(user_text: str) -> str:
-    t = user_text.lower().strip()
-
-    if len(t.split()) <= 2 and t in ["can you", "could you", "will you"]:
-        return "I missed the rest, sir. Could you repeat that?"
-
-    if "test" in t:
-        return "Test received. Systems are responsive."
-
-    if "hello" in t or "hi" in t:
-        return "Hello, Caleb. I am online."
-
-    if "how are you" in t:
-        return "Running smoothly, sir."
-
-    return "I heard you, but the local model returned nothing."
+    return "I did not get a usable response. Please repeat your last request."
 
 # ============================================================
 # TOOL COMMAND PARSING
@@ -2134,9 +2906,6 @@ def extract_tool_command(reply: str):
 
     spoken = remove_hidden_tool_commands(reply)
     spoken = clean_model_text(spoken)
-
-    if not spoken:
-        spoken = "One moment, Caleb."
 
     return spoken, tool, query
 
@@ -2301,6 +3070,25 @@ def force_tool_if_obvious(user_text: str):
     global last_tool_search_query
 
     t = (user_text or "").lower()
+
+    # Local facts (time/date) should never route to web search.
+    local_phrases = [
+        "what time is it",
+        "tell me the time",
+        "current time",
+        "what's the date",
+        "what is the date",
+        "today's date",
+        "todays date",
+        "what day is it",
+        "day of the week",
+        "weekday",
+        "day of month",
+        "day of the month",
+    ]
+
+    if t.strip() in {"time", "date", "weekday"} or any(p in t for p in local_phrases):
+        return "local_info", "datetime"
 
     web_phrases = [
         "google",
@@ -2536,11 +3324,23 @@ def local_info(query: str) -> str:
 
     now = datetime.datetime.now().astimezone()
 
+    def _fmt_time(dt: datetime.datetime) -> str:
+        try:
+            return dt.strftime("%-I:%M %p")
+        except Exception:
+            return dt.strftime("%I:%M %p").lstrip("0")
+
+    def _fmt_date(dt: datetime.datetime) -> str:
+        try:
+            return dt.strftime("%B %-d, %Y")
+        except Exception:
+            return dt.strftime("%B %d, %Y").replace(" 0", " ")
+
     if q in {"", "time"}:
-        return now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        return _fmt_time(now)
 
     if q in {"date", "today"}:
-        return now.strftime("%B %-d, %Y") if "%" in "%-d" else now.strftime("%B %d, %Y").replace(" 0", " ")
+        return _fmt_date(now)
 
     if q in {"day_of_week", "weekday", "day"}:
         return now.strftime("%A")
@@ -2551,7 +3351,7 @@ def local_info(query: str) -> str:
 
     if q in {"datetime", "now"}:
         # Example: Friday, May 29, 2026 at 3:42 PM
-        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        time_str = _fmt_time(now)
         return f"{now.strftime('%A')}, {now.strftime('%B')} {int(now.strftime('%d'))}, {now.strftime('%Y')} at {time_str}"
 
     return f"Unsupported local_info query: {query!r}"
@@ -2583,15 +3383,111 @@ def local_info_response_for_text(text: str) -> str | None:
 
     if t == "time" or any(p in t for p in time_phrases):
         now = datetime.datetime.now().astimezone()
-        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        try:
+            time_str = now.strftime("%-I:%M %p")
+        except Exception:
+            time_str = now.strftime("%I:%M %p").lstrip("0")
         return f"It is {time_str}."
 
     if any(p in t for p in date_phrases) or t in {"date", "day", "weekday"}:
         now = datetime.datetime.now().astimezone()
-        time_str = now.strftime("%-I:%M %p") if "%" in "%-I" else now.strftime("%I:%M %p").lstrip("0")
+        try:
+            time_str = now.strftime("%-I:%M %p")
+        except Exception:
+            time_str = now.strftime("%I:%M %p").lstrip("0")
         return f"Today is {now.strftime('%A')}, {now.strftime('%B')} {int(now.strftime('%d'))}, {now.strftime('%Y')}. It is {time_str}."
 
     return None
+
+def _is_potentially_destructive_command(command: str) -> bool:
+    c = (command or "").strip().lower()
+    if not c:
+        return False
+
+    # Simple heuristics. This is not a security boundary; it's just a guardrail.
+    destructive_patterns = [
+        r"\bremove-item\b",
+        r"\brm\b",
+        r"\bdel\b",
+        r"\berase\b",
+        r"\brmdir\b",
+        r"\brd\b",
+        r"\bformat\b",
+        r"\bshutdown\b",
+        r"\brestart-computer\b",
+        r"\bstop-computer\b",
+        r"\bnet\s+user\b",
+        r"\breg\s+add\b",
+        r"\breg\s+delete\b",
+        r"\bsc\s+delete\b",
+        r"\bsc\s+stop\b",
+    ]
+    for pat in destructive_patterns:
+        if re.search(pat, c):
+            return True
+    return False
+
+
+def command_tool(command: str) -> str:
+    """
+    Executes a PowerShell command with the working directory set to the Jarvis folder.
+    Returns stdout/stderr and the exit code as plain text.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return "No command provided."
+
+    allow_prefix = "ALLOW_DESTRUCTIVE:"
+    allow_destructive = False
+    if cmd.upper().startswith(allow_prefix):
+        allow_destructive = True
+        cmd = cmd[len(allow_prefix):].strip()
+
+    if _is_potentially_destructive_command(cmd) and not allow_destructive:
+        return (
+            "Command blocked as potentially destructive. "
+            "If you really want to run it, prefix the command with 'ALLOW_DESTRUCTIVE:'."
+        )
+
+    workdir = CODEX_DEFAULT_ALLOWED_ROOT
+
+    # Run inside a PowerShell session with a fixed initial working directory.
+    # NOTE: This is not a sandbox. The command can still reference absolute paths.
+    ps_script = (
+        "$ErrorActionPreference = 'Continue'\n"
+        f"Set-Location -LiteralPath '{workdir}'\n"
+        + cmd
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps_script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Command tool error: {e}"
+
+    stdout = (result.stdout or "").rstrip()
+    stderr = (result.stderr or "").rstrip()
+
+    parts = [f"Exit code: {result.returncode}"]
+    if stdout:
+        parts.append("STDOUT:\n" + stdout)
+    if stderr:
+        parts.append("STDERR:\n" + stderr)
+    return "\n\n".join(parts).strip()
 
 def run_tool(tool_name: str, query: str) -> str:
     global last_tool_search_query
@@ -2615,6 +3511,9 @@ def run_tool(tool_name: str, query: str) -> str:
 
     if tool_name == "local_info":
         return local_info(query)
+
+    if tool_name == "command":
+        return command_tool(query)
 
     return "No tool was used."
 
@@ -3008,6 +3907,142 @@ def open_app_from_query(query: str) -> tuple[bool, str]:
         return False, f"I tried to open {item.get('name', q)}, but it failed: {e}"
 
 
+# ============================================================
+# OPEN WINDOWS / CLOSE APPS / OPEN WEBSITES
+# ============================================================
+
+def normalize_url(text: str) -> str:
+    raw = (text or "").strip().strip("\"'")
+    if not raw:
+        return ""
+
+    # If it's something like "google.com", assume https.
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+        raw = "https://" + raw
+
+    return raw
+
+
+def list_open_programs(limit: int = 12) -> list[dict]:
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$procs = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -and $_.MainWindowTitle.Trim().Length -gt 0 }
+$items = $procs | Sort-Object -Property ProcessName | Select-Object -First 200 | ForEach-Object {
+  [pscustomobject]@{
+    name = $_.ProcessName
+    pid = $_.Id
+    title = $_.MainWindowTitle
+  }
+}
+$items | ConvertTo-Json -Compress
+"""
+    data = _run_powershell_json(script, timeout_seconds=10)
+    if isinstance(data, dict):
+        data = [data]
+    items = data if isinstance(data, list) else []
+
+    # Deduplicate by (name,title) but keep best.
+    seen = set()
+    result = []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        title = (it.get("title") or "").strip()
+        key = (name.lower(), title.lower())
+        if not name or not title or key in seen:
+            continue
+        seen.add(key)
+        result.append(it)
+        if len(result) >= max(1, int(limit)):
+            break
+    return result
+
+
+def close_program_by_query(query: str) -> tuple[bool, str]:
+    q = (query or "").strip()
+    if not q:
+        return False, "Which program should I close, sir?"
+
+    # Resolve by matching against open window list first.
+    windows = list_open_programs(limit=80)
+    best = None
+    best_score = 0
+    q_l = q.lower()
+
+    for w in windows:
+        name = (w.get("name") or "")
+        title = (w.get("title") or "")
+        candidate = f"{name} {title}".lower()
+        score = 0
+        if q_l == name.lower():
+            score += 80
+        if q_l in name.lower():
+            score += 35
+        if q_l in title.lower():
+            score += 45
+        if q_l in candidate:
+            score += 15
+        if score > best_score:
+            best_score = score
+            best = w
+
+    if not best or best_score < 30:
+        return False, f"I could not find an open program matching {q!r}."
+
+    pid = best.get("pid")
+    title = (best.get("title") or "").strip()
+    name = (best.get("name") or "").strip() or q
+
+    if not pid:
+        return False, f"I found {name}, but could not resolve its process id."
+
+    # Try graceful close, then force kill if still running.
+    script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$p = Get-Process -Id {int(pid)}
+if ($null -ne $p) {{
+  $null = $p.CloseMainWindow()
+  Start-Sleep -Milliseconds 700
+  $p.Refresh()
+  if (-not $p.HasExited) {{
+    Stop-Process -Id {int(pid)} -Force
+  }}
+}}
+"""
+    _run_powershell_json(script, timeout_seconds=6)
+    label = title if title else name
+    return True, f"Closed {label}."
+
+
+def extract_open_website_query(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    m = re.match(r"^(?:open|go to|visit|browse to)\s+(?:website\s+|site\s+)?(.+)$", t, flags=re.IGNORECASE)
+    if not m:
+        return ""
+
+    candidate = m.group(1).strip(" .,!?:;")
+
+    # Only treat as website if it looks like a URL/domain.
+    if re.search(r"://", candidate) or re.search(r"\.[a-z]{2,}(?:/|$)", candidate, flags=re.IGNORECASE):
+        return candidate
+
+    return ""
+
+
+def open_website(query: str) -> tuple[bool, str]:
+    url = normalize_url(query)
+    if not url:
+        return False, "Which website should I open, sir?"
+
+    try:
+        os.startfile(url)
+        return True, "Opening that now."
+    except Exception as e:
+        return False, f"I could not open that website: {e}"
+
+
 def _clean_tool_sentence(text: str, max_chars: int = 440) -> str:
     text = re.sub(r"\s+", " ", text or "").strip(" -:;\t\n")
     if len(text) > max_chars:
@@ -3196,7 +4231,7 @@ Hard rules:
         },
     ]
 
-    reply = call_lmstudio(
+    reply = call_model(
         messages,
         max_tokens=180,
         temperature=0.15,
@@ -3227,71 +4262,53 @@ def boot():
     global camera
 
     check_sfx_files()
-
-    boot_log(
-        "Initializing Jarvis",
-        "Primary runtime loading",
-        "Initializing systems.",
-    )
-
-    boot_log(
-        "Loading audio system",
-        "Whisper CUDA preparing",
-        "Audio loading.",
-    )
-
-    print("Loading Whisper...")
-    whisper = WhisperModel(
-        WHISPER_MODEL,
-        device=WHISPER_DEVICE,
-        compute_type=WHISPER_COMPUTE,
-    )
-
-    boot_log(
-        "Speech recognition online",
-        "Whisper loaded successfully",
-        "Audio online.",
-    )
-
-    boot_log(
-        "Opening webcam",
-        "Vision stream starting",
-        "Vision loading.",
-    )
+    start_working_sfx()
 
     try:
-        camera = cv2.VideoCapture(WEBCAM_INDEX, cv2.CAP_DSHOW)
+        boot_log("Initializing Jarvis", "Primary runtime loading", "Booting up, sir.")
 
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-        camera.set(cv2.CAP_PROP_FPS, 30)
+        boot_log("Loading audio system", "Whisper preparing", "Bringing my ears online.")
 
-        warmup_camera(15)
-
-    except Exception as e:
-        print("[VISION] Camera open error:", e)
-        camera = None
-
-    if camera is not None and camera.isOpened():
-        boot_log(
-            "Visual input online",
-            "Webcam feed acquired",
-            "Vision online.",
-        )
-    else:
-        boot_log(
-            "Visual input warning",
-            "Webcam unavailable",
-            "Vision offline.",
+        print("Loading Whisper...")
+        whisper = WhisperModel(
+            WHISPER_MODEL,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE,
         )
 
-    boot_log(
-        "Runtime ready",
-        "Main loop prepared",
-        "Systems ready.",
-    )
+        boot_log("Speech recognition online", "Whisper loaded successfully", "Audio online.")
 
-    speak("Jarvis online.", use_working_sfx=False)
+        boot_log("Opening webcam", "Vision stream starting", "Bringing vision online.")
+
+        try:
+            camera = cv2.VideoCapture(WEBCAM_INDEX, cv2.CAP_DSHOW)
+
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            camera.set(cv2.CAP_PROP_FPS, 30)
+
+            warmup_camera(15)
+
+        except Exception as e:
+            print("[VISION] Camera open error:", e)
+            camera = None
+
+        if camera is not None and camera.isOpened():
+            boot_log("Visual input online", "Webcam feed acquired", "Vision online.")
+        else:
+            boot_log("Visual input warning", "Webcam unavailable", "Vision is offline, sir.")
+
+        boot_log("Runtime ready", "Main loop prepared", "All systems ready.")
+
+        threading.Thread(
+            target=speak,
+            args=("Online and at your service.",),
+            kwargs={"use_working_sfx": False},
+            daemon=True,
+        ).start()
+
+    finally:
+        stop_working_sfx(stop_current_sound=True)
 
     print()
     print("Jarvis is running.")
@@ -3303,15 +4320,58 @@ def boot():
 # ============================================================
 
 def handle_user_message(transcript: str):
-    local_reply = local_info_response_for_text(transcript)
-    if local_reply:
-        speak(local_reply, use_working_sfx=False)
+    terminal_cmd = extract_terminal_command(transcript)
+    if terminal_cmd:
+        ok, out = run_terminal_command(terminal_cmd)
+        speak(out, use_working_sfx=False)
         add_history("user", transcript)
-        add_history("assistant", local_reply)
+        add_history("assistant", out)
+        return
+
+    codex_instruction = extract_codex_instruction(transcript)
+    if codex_instruction:
+        rewritten = rewrite_codex_instruction(codex_instruction)
+        codex_bridge_log("instruction", rewritten)
+        reply = "Sent."
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
         return
 
     handled, reply = handle_todo_notes_command(transcript)
     if handled:
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
+        return
+
+    website_query = extract_open_website_query(transcript)
+    if website_query:
+        ok, reply = open_website(website_query)
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
+        return
+
+    if (transcript or "").strip().lower() in {"what's open", "whats open", "what is open", "list programs", "list open programs", "show open programs", "show windows", "list windows"}:
+        items = list_open_programs(limit=10)
+        if not items:
+            reply = "I do not see any open windows."
+        else:
+            names = []
+            for it in items:
+                title = (it.get("title") or "").strip()
+                name = (it.get("name") or "").strip()
+                names.append(title if title else name)
+            reply = "Open windows: " + "; ".join(names[:10]) + "."
+        speak(reply, use_working_sfx=False)
+        add_history("user", transcript)
+        add_history("assistant", reply)
+        return
+
+    m_close = re.match(r"^(?:close|quit|exit)\s+(.+)$", (transcript or "").strip(), flags=re.IGNORECASE)
+    if m_close:
+        ok, reply = close_program_by_query(m_close.group(1))
         speak(reply, use_working_sfx=False)
         add_history("user", transcript)
         add_history("assistant", reply)
@@ -3328,11 +4388,7 @@ def handle_user_message(transcript: str):
     forced_tool, forced_query = force_tool_if_obvious(transcript)
 
     if forced_tool != "none":
-        speak("One moment, Caleb.", use_working_sfx=True)
-
         add_history("user", transcript)
-        add_history("assistant", "One moment, Caleb.")
-
         start_working_sfx()
 
         try:
@@ -3364,14 +4420,16 @@ def handle_user_message(transcript: str):
 
         should_resume_after_speaking = tool != "none"
 
-        speak(
-            spoken_reply,
-            use_working_sfx=True,
-            resume_working_after=should_resume_after_speaking,
-        )
+        if spoken_reply:
+            speak(
+                spoken_reply,
+                use_working_sfx=True,
+                resume_working_after=should_resume_after_speaking,
+            )
 
         add_history("user", transcript)
-        add_history("assistant", spoken_reply)
+        if spoken_reply:
+            add_history("assistant", spoken_reply)
 
         if tool == "none":
             return
@@ -3404,6 +4462,8 @@ def handle_user_message(transcript: str):
 def main():
     global active
     global last_active_time
+    global non_addressed_count
+    global last_non_addressed_time
 
     boot()
 
@@ -3475,6 +4535,26 @@ def main():
             continue
 
         last_active_time = time.time()
+
+        # If already in an active session but the user appears to be talking to
+        # someone else, ignore it and disengage after a couple occurrences.
+        if active and not seems_addressing_jarvis(transcript):
+            now = time.time()
+            if last_non_addressed_time and (now - last_non_addressed_time) > 25:
+                non_addressed_count = 0
+
+            non_addressed_count += 1
+            last_non_addressed_time = now
+            print(f"[STATE] Utterance not addressed to Jarvis (count={non_addressed_count}).")
+
+            if non_addressed_count >= 2:
+                speak("Standing by.", use_working_sfx=False)
+                exit_conversation("auto-disengage: user not addressing Jarvis")
+
+            continue
+
+        non_addressed_count = 0
+        last_non_addressed_time = 0.0
 
         try:
             handle_user_message(transcript)
